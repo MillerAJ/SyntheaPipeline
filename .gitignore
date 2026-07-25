@@ -1,0 +1,21 @@
+# Secrets — never commit these
+.env
+*.p8
+*.pem
+
+# Airflow runtime
+logs/
+plugins/*
+!plugins/.gitkeep
+
+# dbt runtime
+dbt_synthea/target/
+dbt_synthea/dbt_packages/
+dbt_synthea/logs/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS/editor cruft
+.DS_Store

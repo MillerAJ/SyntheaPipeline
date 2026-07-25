@@ -1,0 +1,127 @@
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.9.3
+  env_file:
+    - .env
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-metadata-db/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    # OpenLineage -> Marquez integration. This is what makes Airflow
+    # automatically emit lineage events for every DAG run.
+    OPENLINEAGE_URL: http://marquez:5000
+    OPENLINEAGE_NAMESPACE: synthea_pipeline
+    AIRFLOW__LINEAGE__BACKEND: openlineage.lineage_backend.OpenLineageBackend
+    # pip packages installed on container start (fine for a resume/demo project;
+    # for anything long-lived, bake these into a custom image instead)
+    _PIP_ADDITIONAL_REQUIREMENTS: >-
+      openlineage-airflow
+      dbt-postgres
+      openlineage-dbt
+      snowflake-connector-python[pandas]
+      python-dotenv
+      cryptography
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./dbt_synthea:/opt/airflow/dbt_synthea
+    - ~/.snowflake:/home/airflow/.snowflake:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  # Lets containers reach Postgres running directly on the LXC host
+  # (staging_db is NOT containerized — it's the existing local install)
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    airflow-metadata-db:
+      condition: service_healthy
+
+services:
+
+  airflow-metadata-db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-metadata-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname admin \
+          --lastname admin \
+          --role Admin \
+          --email admin@example.com \
+          --password admin
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      - airflow-init
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      - airflow-init
+
+  # --- Marquez (OpenLineage-compatible lineage server) ---
+
+  marquez-db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB: marquez
+    volumes:
+      - marquez-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "marquez"]
+      interval: 5s
+      retries: 5
+
+  marquez:
+    image: marquezproject/marquez:0.48.0
+    environment:
+      MARQUEZ_PORT: 5000
+      MARQUEZ_ADMIN_PORT: 5001
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+    depends_on:
+      marquez-db:
+        condition: service_healthy
+    command: ["--config", "/usr/src/app/config/marquez.yml"]
+    volumes:
+      - ./marquez.yml:/usr/src/app/config/marquez.yml
+
+  marquez-web:
+    image: marquezproject/marquez-web:0.48.0
+    environment:
+      MARQUEZ_HOST: marquez
+      MARQUEZ_PORT: 5000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - marquez
+
+volumes:
+  airflow-metadata-db-volume:
+  marquez-db-volume:

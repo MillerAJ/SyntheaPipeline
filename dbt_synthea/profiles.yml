@@ -1,0 +1,12 @@
+synthea_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: host.docker.internal
+      user: postgres
+      password: "{{ env_var('POSTGRES_PASSWORD') }}"
+      port: 5432
+      dbname: staging_db
+      schema: public
+      threads: 4
