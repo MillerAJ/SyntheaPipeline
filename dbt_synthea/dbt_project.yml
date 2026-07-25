@@ -1,0 +1,17 @@
+name: 'synthea_pipeline'
+version: '1.0.0'
+config-version: 2
+
+profile: 'synthea_pipeline'
+
+model-paths: ["models"]
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  synthea_pipeline:
+    staging:
+      +materialized: table
+      +schema: flat
