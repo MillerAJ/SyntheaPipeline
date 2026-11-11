@@ -1,0 +1,123 @@
+version: 2
+
+models:
+  - name: patients
+    columns:
+      - name: patient_id
+        tests:
+          - not_null
+          - unique
+  - name: encounters
+    columns:
+      - name: encounter_id
+        tests:
+          - not_null
+          - unique
+  - name: observations
+    columns:
+      - name: observation_id
+        tests:
+          - not_null
+          - unique
+  - name: conditions
+    columns:
+      - name: condition_id
+        tests:
+          - not_null
+          - unique
+  - name: claims
+    columns:
+      - name: claim_id
+        tests:
+          - not_null
+          - unique
+  - name: procedures
+    columns:
+      - name: procedure_id
+        tests:
+          - not_null
+          - unique
+  - name: medications
+    columns:
+      - name: medication_id
+        tests:
+          - not_null
+          - unique
+  - name: immunizations
+    columns:
+      - name: immunization_id
+        tests:
+          - not_null
+          - unique
+  - name: care_plans
+    columns:
+      - name: care_plan_id
+        tests:
+          - not_null
+          - unique
+  - name: explanation_of_benefits
+    columns:
+      - name: eob_id
+        tests:
+          - not_null
+          - unique
+  - name: diagnostic_reports
+    columns:
+      - name: diagnostic_report_id
+        tests:
+          - not_null
+          - unique
+  - name: document_references
+    columns:
+      - name: document_reference_id
+        tests:
+          - not_null
+          - unique
+  - name: medication_requests
+    columns:
+      - name: medication_request_id
+        tests:
+          - not_null
+          - unique
+  - name: medication_administrations
+    columns:
+      - name: medication_administration_id
+        tests:
+          - not_null
+          - unique
+  - name: supply_deliveries
+    columns:
+      - name: supply_delivery_id
+        tests:
+          - not_null
+          - unique
+  - name: devices
+    columns:
+      - name: device_id
+        tests:
+          - not_null
+          - unique
+  - name: imaging_studies
+    columns:
+      - name: imaging_study_id
+        tests:
+          - not_null
+          - unique
+  - name: care_teams
+    columns:
+      - name: care_team_id
+        tests:
+          - not_null
+          - unique
+  - name: allergy_intolerances
+    columns:
+      - name: allergy_intolerance_id
+        tests:
+          - not_null
+          - unique
+  - name: provenances
+    columns:
+      - name: provenance_id
+        tests:
+          - not_null
+          - unique

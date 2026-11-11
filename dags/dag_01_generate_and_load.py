@@ -1,144 +1,139 @@
 """
-DAG 1: Generate Synthea data and load it into Postgres raw.raw_synthea.
+DAG 1: Generate Synthea FHIR R4 JSON bundles and load them into PostgreSQL.
 
-Runs the batch loop (generate -> consolidate/gzip -> Postgres insert) for
-every batch, then triggers dag_02_dbt_transform once all batches are loaded.
+Generates patient clinical data via the Synthea Java CLI executable into JSON bundles,
+staged locally, and ingests them into raw.fhir_bundles (JSONB column) using SQLAlchemy.
 """
+import glob
+import json
 import os
 import shutil
 import subprocess
-import sys
-import glob
-import json
-import gzip
+from datetime import datetime
+from urllib.parse import quote_plus
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from datetime import datetime
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 
-import psycopg2
-from psycopg2 import extras
+load_dotenv()
 
-SYNTHEA_DIR = os.path.expanduser("~/synthea")
-FHIR_DIR = os.path.join(SYNTHEA_DIR, "output", "fhir")
-OUTPUT_DIR = os.path.join(SYNTHEA_DIR, "output")
-JAR_NAME = "synthea-with-dependencies.jar"
-SYNTHEA_JAR_PATH = os.path.join(SYNTHEA_DIR, "build", "libs", JAR_NAME)
-
-TOTAL_POPULATION = 200000
-BATCH_SIZE = 10000
-POSTGRES_BATCH_SIZE = 1000
-STATE = "New York"
-THREADS = 12
-
-DB_CONFIG = {
-    "dbname": "staging_db",
-    "user": "postgres",
-    "password": os.getenv("POSTGRES_PASSWORD"),
-    "host": "host.docker.internal",  # containers reach host Postgres via this
-    "port": "5432",
-}
+DB_USER = os.getenv("POSTGRES_USER", "airflow")
+DB_PASSWORD = os.getenv("STAGING_DB_PASSWORD")  # set in .env; checked at task runtime
+DB_HOST = os.getenv("POSTGRES_HOST", "airflow-metadata-db")
+DB_PORT = os.getenv("POSTGRES_PORT", "5432")
+DB_NAME = os.getenv("POSTGRES_DB", "staging_db")
 
 
-def check_disk_space(min_free_gb=20):
-    total, used, free = shutil.disk_usage("/")
-    free_gb = free / (1024 ** 3)
-    if free_gb < min_free_gb:
-        raise RuntimeError(f"Only {free_gb:.1f} GB free — aborting before it gets worse.")
-    print(f"💾 {free_gb:.1f} GB free — OK to proceed.")
+# Directories & Execution Params
+SYNTHEA_DIR = os.getenv("SYNTHEA_DIR", "/opt/airflow/synthea")
+OUTPUT_DIR = os.path.join(SYNTHEA_DIR, "fhir")
+NUM_PATIENTS = int(os.getenv("SYNTHEA_PATIENTS", "100"))
 
 
-def clean_output_directory():
-    print("🧹 Cleaning local FHIR output directory...")
-    if os.path.exists(FHIR_DIR):
-        for filename in os.listdir(FHIR_DIR):
-            file_path = os.path.join(FHIR_DIR, filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-            except Exception as e:
-                print(f"Failed to delete {file_path}. Reason: {e}")
-    else:
-        os.makedirs(FHIR_DIR, exist_ok=True)
+def generate_and_load_fhir():
+    if not DB_PASSWORD:
+        raise RuntimeError("STAGING_DB_PASSWORD is not set. Add it to the pipeline .env and recreate the Airflow containers.")
+    engine = create_engine(
+        f"postgresql://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    )
 
+    # 1. Ensure landing schema and target JSONB table exist with an explicit unique constraint
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS raw;"))
+        conn.execute(
+            text(
+                """
+            CREATE TABLE IF NOT EXISTS raw.fhir_bundles (
+                id SERIAL PRIMARY KEY,
+                file_name VARCHAR(255) NOT NULL,
+                payload JSONB NOT NULL,
+                loaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uq_fhir_file_name UNIQUE (file_name)
+            );
+        """
+            )
+        )
 
-def run_synthea_generation(batch_size):
+    # 2. Check disk space before kicking off generation
+    stat = shutil.disk_usage("/")
+    free_gb = stat.free / (1024**3)
+    print(f"{free_gb:.2f} GB free disk space available.")
+    if free_gb < 1.0:
+        raise RuntimeError(f"Insufficient disk space ({free_gb:.2f} GB available). Aborting run.")
+
+    # 3. Ensure output directory exists and clean up stale FHIR output files if present
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if os.path.exists(OUTPUT_DIR):
+        for f in glob.glob(f"{OUTPUT_DIR}/*.json"):
+            os.remove(f)
+
+    # 4. Execute Synthea Java CLI
+    synthea_jar = glob.glob(f"{SYNTHEA_DIR}/synthea-with-dependencies*.jar")
+    if not synthea_jar:
+        raise FileNotFoundError(f"Could not locate Synthea JAR in {SYNTHEA_DIR}")
+
     cmd = [
-        "java", "-Xms16g", "-Xmx48g",
-        "-jar", SYNTHEA_JAR_PATH,
-        "-p", str(batch_size),
-        "-t", str(THREADS),
-        STATE,
+        "java",
+        "-jar",
+        synthea_jar[0],
+        "-p",
+        str(NUM_PATIENTS),
+        "--exporter.fhir.export=true",
+        "--exporter.hospital.fhir.export=false",
+        "--exporter.practitioner.fhir.export=false",
+        f"--exporter.baseDirectory={SYNTHEA_DIR}",
+        "New York",
     ]
-    subprocess.run(cmd, cwd=SYNTHEA_DIR, check=True)
 
+    print(f"Executing Synthea command: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
 
-def consolidate_and_compress(batch_num):
-    compressed_file_path = os.path.join(OUTPUT_DIR, f"ny_patients_batch_{batch_num}.json.gz")
-    json_files = glob.glob(os.path.join(FHIR_DIR, "*.json"))
+    # 5. Ingest JSON bundles into Postgres raw.fhir_bundles
+    json_files = glob.glob(os.path.join(OUTPUT_DIR, "*.json"))
+    print(f"Discovered {len(json_files)} FHIR JSON bundles to ingest.")
+
     if not json_files:
-        return None
-
-    with gzip.open(compressed_file_path, "wt", encoding="utf-8") as f_out:
-        for file_path in json_files:
-            if "hospitalInformation" in file_path or "practitionerInformation" in file_path:
-                continue
-            try:
-                with open(file_path, "r", encoding="utf-8") as f_in:
-                    record = json.load(f_in)
-                    f_out.write(json.dumps(record) + "\n")
-            except Exception as e:
-                print(f"⚠️ Error processing file {file_path}: {e}")
-
-    return compressed_file_path
+        raise ValueError(f"No JSON bundle files found in directory: {OUTPUT_DIR}. Aborting run.")
 
 
-def trigger_postgres_upload(compressed_file_path):
-    if not compressed_file_path or not os.path.exists(compressed_file_path):
-        return
+    records = []
+    for file_path in json_files:
+        file_name = os.path.basename(file_path)
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            records.append({"file_name": file_name, "payload": json.dumps(data)})
 
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    insert_query = "INSERT INTO raw.raw_synthea (payload) VALUES %s"
-    batch_data = []
-    uploaded_count = 0
+    # insert_sql = text(
+    #     """
+    #     INSERT INTO raw.fhir_bundles (file_name, payload)
+    #     VALUES (:file_name, :payload::jsonb)
+    # """
+    # )
 
-    with gzip.open(compressed_file_path, "rt", encoding="utf-8") as f_in:
-        for line in f_in:
-            clean_line = line.strip()
-            if not clean_line:
-                continue
-            json_str = json.dumps(json.loads(clean_line), ensure_ascii=True)
-            batch_data.append((json_str,))
-            if len(batch_data) >= POSTGRES_BATCH_SIZE:
-                extras.execute_values(cursor, insert_query, batch_data)
-                conn.commit()
-                uploaded_count += len(batch_data)
-                batch_data = []
-        if batch_data:
-            extras.execute_values(cursor, insert_query, batch_data)
-            conn.commit()
-            uploaded_count += len(batch_data)
+    insert_sql = text("""
+        INSERT INTO raw.fhir_bundles (file_name, payload)
+        VALUES (:file_name, CAST(:payload AS jsonb))
+        ON CONFLICT (file_name) DO UPDATE 
+        SET payload = EXCLUDED.payload, loaded_at = CURRENT_TIMESTAMP
+    """)
 
-    print(f"✅ Loaded {uploaded_count} records.")
-    cursor.close()
-    conn.close()
-    os.remove(compressed_file_path)
+    with engine.begin() as conn:
+        conn.execute(insert_sql, records)
 
+    print(f"Successfully ingested {len(records)} bundles into raw.fhir_bundles.")
 
-def run_all_batches():
-    total_batches = (TOTAL_POPULATION + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(1, total_batches + 1):
-        print(f"--- Batch {i} of {total_batches} ---")
-        check_disk_space()
-        clean_output_directory()
-        run_synthea_generation(batch_size=BATCH_SIZE)
-        compressed_path = consolidate_and_compress(batch_num=i)
-        clean_output_directory()
-        trigger_postgres_upload(compressed_path)
+    # 6. Cleanup local temporary FHIR files safely
+    for file_path in json_files:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            print(f"Could not remove temporary file {file_path}: {e}")
+            
+    print("Temporary FHIR JSON output files cleaned up.")
 
 
 default_args = {
@@ -149,20 +144,16 @@ default_args = {
 with DAG(
     dag_id="dag_01_generate_and_load",
     default_args=default_args,
-    schedule=None,  # triggered manually or externally, not on a fixed schedule
+    schedule=None,
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=["synthea", "generate"],
+    tags=["synthea", "fhir", "postgres"],
 ) as dag:
 
-    generate_and_load = PythonOperator(
+    generate_and_load_task = PythonOperator(
         task_id="generate_and_load_all_batches",
-        python_callable=run_all_batches,
+        python_callable=generate_and_load_fhir,
     )
 
-    trigger_dbt = TriggerDagRunOperator(
-        task_id="trigger_dbt_transform",
-        trigger_dag_id="dag_02_dbt_transform",
-    )
 
-    generate_and_load >> trigger_dbt
+
