@@ -1,16 +1,22 @@
 """
-DAG 2: Run dbt against Postgres to flatten raw.raw_synthea into flat.* tables.
+DAG 2: Run dbt against Postgres to parse raw FHIR R4 JSON bundles (raw.fhir_bundles)
+into flat per-resource tables in the `flat` schema (patients, encounters, observations, ...).
 
-Uses `dbt-ol` (the openlineage-dbt wrapper) instead of the plain `dbt`
-command — it runs dbt normally but also emits lineage events to Marquez
-for every model, picking up column-level lineage where dbt supports it.
+dbt is installed into an isolated virtualenv (/opt/airflow/dbt_venv) to avoid
+dependency conflicts with Airflow's core Python environment.
+
+Lineage metadata is automatically emitted to Marquez via openlineage-dbt (dbt-ol).
 """
+import os
+from datetime import datetime
+
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from datetime import datetime
 
-DBT_PROJECT_DIR = "/opt/airflow/dbt_synthea"
+DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/opt/airflow/dbt_synthea")
+DBT_VENV_DIR = os.getenv("DBT_VENV_DIR", "/opt/airflow/dbt_venv")
+MARQUEZ_URL = os.getenv("MARQUEZ_URL", "http://marquez:8080")
 
 default_args = {
     "owner": "airflow",
@@ -23,14 +29,28 @@ with DAG(
     schedule=None,
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=["synthea", "dbt"],
+    tags=["synthea", "dbt", "fhir", "json"],
 ) as dag:
+
+    setup_dbt_venv = BashOperator(
+        task_id="setup_dbt_venv",
+        bash_command=(
+            f"if [ ! -f {DBT_VENV_DIR}/bin/dbt ]; then "
+            f"  python3 -m venv {DBT_VENV_DIR} && "
+            f"  {DBT_VENV_DIR}/bin/pip install --quiet --upgrade pip && "
+            f"  {DBT_VENV_DIR}/bin/pip install --quiet dbt-postgres openlineage-dbt; "
+            f"else "
+            f"  echo 'dbt venv already exists, skipping install'; "
+            f"fi"
+        ),
+    )
 
     dbt_run = BashOperator(
         task_id="dbt_run",
         bash_command=(
             f"cd {DBT_PROJECT_DIR} && "
-            f"OPENLINEAGE_URL=http://marquez:5000 "
+            f"export PATH={DBT_VENV_DIR}/bin:$PATH && "
+            f"OPENLINEAGE_URL={MARQUEZ_URL} "
             f"OPENLINEAGE_NAMESPACE=synthea_pipeline "
             f"dbt-ol run --profiles-dir {DBT_PROJECT_DIR}"
         ),
@@ -40,13 +60,14 @@ with DAG(
         task_id="dbt_test",
         bash_command=(
             f"cd {DBT_PROJECT_DIR} && "
+            f"export PATH={DBT_VENV_DIR}/bin:$PATH && "
             f"dbt test --profiles-dir {DBT_PROJECT_DIR}"
         ),
     )
 
-    trigger_snowflake_push = TriggerDagRunOperator(
-        task_id="trigger_snowflake_push",
-        trigger_dag_id="dag_03_snowflake_push",
-    )
+    setup_dbt_venv >> dbt_run >> dbt_test
 
-    dbt_run >> dbt_test >> trigger_snowflake_push
+
+
+
+    
