@@ -1,0 +1,7 @@
+streamlit
+pandas
+altair
+requests
+snowflake-connector-python
+cryptography
+toml

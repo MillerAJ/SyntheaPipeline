@@ -19,3 +19,14 @@ __pycache__/
 
 # OS/editor cruft
 .DS_Store
+
+# Dashboard runtime and secrets
+dashboard/.streamlit/secrets.toml
+.streamlit/secrets.toml
+.tokens_served.json
+snowflake_cache.json
+.refresh_lock
+*.bak*
+
+# Local model-server address (never commit)
+.model_host
