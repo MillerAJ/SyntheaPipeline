@@ -101,6 +101,23 @@ st.markdown(
     .st-key-chatopts [data-testid="stMetricValue"] { font-size: 1.5rem !important; }
     .st-key-chatopts [data-testid="stMetricLabel"] p { font-size: 0.85rem !important; }
     .stApp:has([data-baseweb="tab-list"] button[aria-selected="true"]:nth-of-type(2)) .st-key-chatopts { display: block; }
+    /* Layout polish: the AI Chat page fits the viewport, and the sidebar uses one spacing rhythm */
+    [data-testid="stMainBlockContainer"] { padding-bottom: 1rem !important; }
+    [data-testid="stLayoutWrapper"]:has(> .st-key-chatwindow) { height: calc(100vh - 500px) !important; min-height: 220px !important; flex: 0 0 auto !important; }
+    .stVerticalBlock.st-key-chatwindow { height: calc(100vh - 500px) !important; max-height: calc(100vh - 500px) !important; min-height: 220px !important; }
+    [data-testid="stSidebarUserContent"] { padding-bottom: 0.5rem !important; }
+    [data-testid="stChatInput"] > div > div { flex-direction: row !important; align-items: flex-end !important; }
+    [data-testid="stChatInput"] > div > div > div:first-child { flex: 1 1 auto; min-width: 0; }
+    [data-testid="stSidebarHeader"] { height: 2rem !important; min-height: 0 !important; padding-top: 0.5rem !important; padding-bottom: 0 !important; }
+    [data-testid="stSidebarUserContent"] [data-testid="stVerticalBlock"] { gap: 0.5rem; }
+    [data-testid="stSidebarUserContent"] hr { margin: 0.3rem 0 !important; }
+    .st-key-chatopts [data-testid="stVerticalBlock"] { gap: 0.5rem; }
+    /* Sidebar breathing room: headings, dividers, metric, buttons */
+    .st-key-chatopts [data-testid="stMarkdownContainer"]:has(h4) { padding: 1.5rem 0 1.1rem 0; }
+    [data-testid="stSidebarUserContent"] .st-key-chatopts hr { margin: 1rem 0 !important; }
+    .st-key-chatopts [data-testid="stMetric"] { padding: 0.75rem 0; }
+    .st-key-chatopts .st-key-sysprompt_btn, .st-key-chatopts .st-key-reset_chat_btn { padding: 0.5rem 0; }
+    .st-key-chatopts .st-key-sysprompt_btn button, .st-key-chatopts .st-key-reset_chat_btn button { padding: 0.6rem 1rem; }
     </style>
 """,
     unsafe_allow_html=True,
@@ -476,9 +493,9 @@ def _hero_html(path, mtime):
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
     return (
-        '<div style="height:460px;display:flex;align-items:center;justify-content:center;">'
+        '<div style="height:calc(100vh - 570px);min-height:170px;display:flex;align-items:center;justify-content:center;">'
         f'<img src="data:image/{mime};base64,{b64}" '
-        'style="width:22%;max-width:260px;min-width:140px;pointer-events:none;user-select:none;" alt=""></div>'
+        'style="height:clamp(110px, calc(100vh - 650px), 240px);width:auto;pointer-events:none;user-select:none;" alt=""></div>'
     )
 
 
@@ -524,7 +541,7 @@ with tab_chat:
                    "conversation's working state is in use right now, across all visitors at once.")
 
     # Framed, scrollable chat window; the input sits right below it
-    chat_box = st.container(height=520, border=True)
+    chat_box = st.container(height=520, border=True, key="chatwindow")
     hero_slot = chat_box.empty()
     if not st.session_state.chat_messages:
         _hero = next((f for f in ("chat_hero.png", "chat_hero.jpg", "chat_hero.jpeg", "chat_hero.webp", "chat_hero.gif")
@@ -538,7 +555,8 @@ with tab_chat:
                     st.markdown(m["reasoning"])
             st.markdown(m["content"])
 
-    stat_slot = st.empty()
+    _sc, _cc = st.columns([6, 1], vertical_alignment="center")
+    stat_slot = _sc.empty()
     _show_last_stats(stat_slot)
 
     prompt = st.chat_input("Chat here...", max_chars=CHAT_MAX_INPUT_CHARS)
@@ -648,7 +666,7 @@ with tab_chat:
                 with reg["lock"]:
                     reg["busy"].pop(busy_key, None)
 
-    if st.session_state.chat_messages and st.button("🧹 Clear chat"):
+    if _cc.button("🧹 Clear", key="clear_chat", disabled=not st.session_state.chat_messages, width="stretch"):
         st.session_state.chat_messages = []
         st.session_state.ctx_used = 0
         for _k in ("last_stats", "cloud_in", "cloud_out"):
@@ -1025,6 +1043,25 @@ with tab_dash:
 # =====================================================================================
 with st.sidebar.container(key="chatopts"):
     st.divider()
+    st.markdown("#### 💬 Chat settings")
+    if st.button("📝 System prompt", width="stretch", key="sysprompt_btn"):
+        _system_prompt_dialog()
+    st.select_slider(
+        "🧠 Thinking effort",
+        options=["Off", "Low", "Medium", "Max"],
+        value=CHAT_DEFAULTS["chat_effort"],
+        key="chat_effort",
+        help="How hard the model reasons before answering. Off is fastest; Max thinks the longest.",
+    )
+    st.slider(
+        "🌡️ Temperature", 0.0, 1.5, CHAT_DEFAULTS["chat_temp"], 0.05, key="chat_temp",
+        help="Low = focused and predictable, high = more creative and random.",
+    )
+    st.slider(
+        "🎯 Top-p", 0.1, 1.0, CHAT_DEFAULTS["chat_top_p"], 0.05, key="chat_top_p",
+        help="Only sample from the smallest set of words whose probabilities add up to this value.",
+    )
+    st.divider()
     st.markdown("#### 💵 Cost estimate")
     _tier = st.selectbox(
         "Compare against", list(CLOUD_PRICES), index=1, key="cloud_tier",
@@ -1043,27 +1080,8 @@ with st.sidebar.container(key="chatopts"):
              "Here there are no per-token fees, just electricity.",
     )
     st.markdown(
-        '<div style="font-size:0.85rem;opacity:0.7;line-height:1.5">This conversation<br>'
+        '<div style="font-size:0.85rem;opacity:0.7;line-height:1.5;padding-bottom:1.1rem">This conversation<br>'
         f'In: {st.session_state.get("cloud_in", 0):,} tokens<br>Out: {st.session_state.get("cloud_out", 0):,} tokens</div>',
         unsafe_allow_html=True,
     )
-    st.divider()
-    st.markdown("#### 💬 Chat settings")
-    st.select_slider(
-        "🧠 Thinking effort",
-        options=["Off", "Low", "Medium", "Max"],
-        value=CHAT_DEFAULTS["chat_effort"],
-        key="chat_effort",
-        help="How hard the model reasons before answering. Off is fastest; Max thinks the longest.",
-    )
-    st.slider(
-        "🌡️ Temperature", 0.0, 1.5, CHAT_DEFAULTS["chat_temp"], 0.05, key="chat_temp",
-        help="Low = focused and predictable, high = more creative and random.",
-    )
-    st.slider(
-        "🎯 Top-p", 0.1, 1.0, CHAT_DEFAULTS["chat_top_p"], 0.05, key="chat_top_p",
-        help="Only sample from the smallest set of words whose probabilities add up to this value.",
-    )
-    if st.button("📝 System prompt", width="stretch"):
-        _system_prompt_dialog()
-    st.button("↩️ Reset chat settings", width="stretch", on_click=_reset_chat_opts)
+    st.button("↩️ Reset chat settings", width="stretch", on_click=_reset_chat_opts, key="reset_chat_btn")
