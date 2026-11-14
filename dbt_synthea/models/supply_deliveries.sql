@@ -10,6 +10,8 @@ SELECT
     resource -> 'suppliedItem' -> 'itemCodeableConcept' -> 'coding' -> 0 ->> 'code'    AS item_code,
     resource -> 'suppliedItem' -> 'itemCodeableConcept' -> 'coding' -> 0 ->> 'display' AS item_description,
     (resource -> 'suppliedItem' -> 'quantity' ->> 'value')::numeric          AS quantity,
-    (resource ->> 'occurrenceDateTime')::timestamptz                         AS occurrence_at
+    (resource ->> 'occurrenceDateTime')::timestamptz                         AS occurrence_at,
+    resource -> 'type' -> 'coding' -> 0 ->> 'display'                                                AS type_display,
+    resource -> 'suppliedItem' -> 'itemCodeableConcept' ->> 'text'                                   AS item_text
 FROM {{ ref('base_synthea_entries') }}
 WHERE resource_type = 'SupplyDelivery'

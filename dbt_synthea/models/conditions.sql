@@ -13,6 +13,8 @@ SELECT
     resource -> 'code' -> 'coding' -> 0 ->> 'display'                        AS description,
     (resource ->> 'onsetDateTime')::timestamptz                              AS onset_at,
     (resource ->> 'abatementDateTime')::timestamptz                          AS abatement_at,
-    (resource ->> 'recordedDate')::timestamptz                               AS recorded_at
+    (resource ->> 'recordedDate')::timestamptz                               AS recorded_at,
+    resource -> 'code' ->> 'text'                                                                    AS code_text,
+    resource -> 'category' -> 0 -> 'coding' -> 0 ->> 'display'                                       AS category_display
 FROM {{ ref('base_synthea_entries') }}
 WHERE resource_type = 'Condition'

@@ -15,7 +15,7 @@ with DAG(
     dag_id="dag_00_master",
     default_args=default_args,
     description="Orchestrates full Synthea pipeline DAGs 01 through 04 sequentially",
-    schedule_interval=None,  # Set your desired cron schedule here later
+    schedule_interval="*/5 * * * *",  # every 5 minutes: Snowpipe makes small, frequent loads cheap
     catchup=False,
     max_active_runs=1,
 ) as dag:

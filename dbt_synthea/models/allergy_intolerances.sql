@@ -13,6 +13,10 @@ SELECT
     resource -> 'clinicalStatus' -> 'coding' -> 0 ->> 'code'                 AS clinical_status,
     resource -> 'verificationStatus' -> 'coding' -> 0 ->> 'code'             AS verification_status,
     (resource ->> 'recordedDate')::timestamptz                               AS recorded_at,
-    resource -> 'reaction' -> 0 -> 'manifestation' -> 0 -> 'coding' -> 0 ->> 'display' AS reaction_description
+    resource -> 'reaction' -> 0 -> 'manifestation' -> 0 -> 'coding' -> 0 ->> 'display' AS reaction_description,
+    resource -> 'code' ->> 'text'                                                                    AS code_text,
+    resource -> 'reaction' -> 0 ->> 'severity'                                                       AS reaction_severity,
+    resource -> 'reaction' -> 0 -> 'manifestation' -> 0 -> 'coding' -> 0 ->> 'code'                  AS reaction_manifestation_code,
+    jsonb_array_length(resource -> 'reaction')                                                       AS reaction_count
 FROM {{ ref('base_synthea_entries') }}
 WHERE resource_type = 'AllergyIntolerance'

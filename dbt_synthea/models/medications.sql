@@ -6,6 +6,7 @@ SELECT
     resource ->> 'id'                                                        AS medication_id,
     resource ->> 'status'                                                    AS status,
     resource -> 'code' -> 'coding' -> 0 ->> 'code'                           AS code,
-    resource -> 'code' -> 'coding' -> 0 ->> 'display'                        AS description
+    resource -> 'code' -> 'coding' -> 0 ->> 'display'                        AS description,
+    resource -> 'code' ->> 'text'                                                                    AS code_text
 FROM {{ ref('base_synthea_entries') }}
 WHERE resource_type = 'Medication'

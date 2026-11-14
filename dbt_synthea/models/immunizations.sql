@@ -11,6 +11,8 @@ SELECT
     resource -> 'vaccineCode' -> 'coding' -> 0 ->> 'display'                 AS description,
     (resource ->> 'occurrenceDateTime')::timestamptz                         AS occurrence_at,
     (resource ->> 'primarySource')::boolean                                  AS primary_source,
-    resource -> 'location' ->> 'display'                                     AS location_name
+    resource -> 'location' ->> 'display'                                     AS location_name,
+    resource -> 'vaccineCode' ->> 'text'                                                             AS vaccine_text,
+    resource -> 'location' ->> 'reference'                                                           AS location_reference
 FROM {{ ref('base_synthea_entries') }}
 WHERE resource_type = 'Immunization'
