@@ -12,6 +12,11 @@ SELECT
     (resource -> 'performedPeriod' ->> 'start')::timestamptz                 AS performed_start_at,
     (resource -> 'performedPeriod' ->> 'end')::timestamptz                   AS performed_end_at,
     resource -> 'location' ->> 'display'                                     AS location_name,
-    resource -> 'reasonReference' -> 0 ->> 'display'                         AS reason_description
+    resource -> 'reasonReference' -> 0 ->> 'display'                         AS reason_description,
+    resource -> 'code' ->> 'text'                                                                    AS code_text,
+    resource -> 'location' ->> 'reference'                                                           AS location_reference,
+    resource -> 'reasonCode' -> 0 -> 'coding' -> 0 ->> 'code'                                        AS reason_code,
+    resource -> 'reasonCode' -> 0 -> 'coding' -> 0 ->> 'display'                                     AS reason_code_description,
+    {{ fhir_id("resource -> 'reasonReference' -> 0 ->> 'reference'") }}                              AS reason_reference_id
 FROM {{ ref('base_synthea_entries') }}
 WHERE resource_type = 'Procedure'

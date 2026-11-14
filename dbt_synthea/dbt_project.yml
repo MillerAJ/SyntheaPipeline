@@ -12,6 +12,5 @@ clean-targets:
 
 models:
   synthea_pipeline:
-    staging:
-      +materialized: table
-      +schema: flat
+    +materialized: table
+    +schema: flat

@@ -16,6 +16,10 @@ SELECT
     resource -> 'performer' -> 0 ->> 'display'                               AS performer_name,
     jsonb_array_length(resource -> 'result')                                 AS result_count,
     resource -> 'presentedForm' -> 0 ->> 'contentType'                       AS note_content_type,
-    convert_from(decode(resource -> 'presentedForm' -> 0 ->> 'data', 'base64'), 'UTF8') AS note_text
+    convert_from(decode(resource -> 'presentedForm' -> 0 ->> 'data', 'base64'), 'UTF8') AS note_text,
+    resource -> 'code' ->> 'text'                                                                    AS code_text,
+    resource -> 'category' -> 0 -> 'coding' -> 0 ->> 'display'                                       AS category_display,
+    resource -> 'performer' -> 0 ->> 'reference'                                                     AS performer_reference,
+    jsonb_array_length(resource -> 'performer')                                                      AS performer_count
 FROM {{ ref('base_synthea_entries') }}
 WHERE resource_type = 'DiagnosticReport'

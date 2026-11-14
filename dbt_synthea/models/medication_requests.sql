@@ -19,6 +19,17 @@ SELECT
     (resource -> 'dosageInstruction' -> 0 -> 'doseAndRate' -> 0 -> 'doseQuantity' ->> 'value')::numeric AS dose_quantity,
     (resource -> 'dosageInstruction' -> 0 -> 'timing' -> 'repeat' ->> 'frequency')::int                AS dose_frequency,
     (resource -> 'dosageInstruction' -> 0 -> 'timing' -> 'repeat' ->> 'period')::numeric               AS dose_period,
-    resource -> 'dosageInstruction' -> 0 -> 'timing' -> 'repeat' ->> 'periodUnit'                      AS dose_period_unit
+    resource -> 'dosageInstruction' -> 0 -> 'timing' -> 'repeat' ->> 'periodUnit'                      AS dose_period_unit,
+    resource -> 'medicationCodeableConcept' ->> 'text'                                               AS medication_text,
+    resource -> 'category' -> 0 -> 'coding' -> 0 ->> 'display'                                       AS category_display,
+    resource -> 'requester' ->> 'reference'                                                          AS requester_reference,
+    resource -> 'reasonCode' -> 0 -> 'coding' -> 0 ->> 'code'                                        AS reason_code,
+    {{ fhir_id("resource -> 'reasonReference' -> 0 ->> 'reference'") }}                              AS reason_reference_id,
+    resource -> 'dosageInstruction' -> 0 ->> 'text'                                                  AS dosage_text,
+    (resource -> 'dosageInstruction' -> 0 ->> 'asNeededBoolean')::boolean                            AS as_needed,
+    resource -> 'dosageInstruction' -> 0 -> 'doseAndRate' -> 0 -> 'type' -> 'coding' -> 0 ->> 'code' AS dose_type_code,
+    resource -> 'dosageInstruction' -> 0 -> 'additionalInstruction' -> 0 -> 'coding' -> 0 ->> 'code' AS additional_instruction_code,
+    resource -> 'dosageInstruction' -> 0 -> 'additionalInstruction' -> 0 ->> 'text'                  AS additional_instruction_text,
+    jsonb_array_length(resource -> 'dosageInstruction')                                              AS dosage_count
 FROM {{ ref('base_synthea_entries') }}
 WHERE resource_type = 'MedicationRequest'
