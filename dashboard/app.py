@@ -73,6 +73,18 @@ st.markdown(
     [data-testid="stChatInput"]:focus-within {
         box-shadow: 0 0 0 5px rgba(37,99,235,0.35), 0 6px 24px rgba(37,99,235,0.25) !important;
     }
+    /* AI Chat: soft blue Attach files button, same blue as the chat input */
+    .st-key-attachpop button {
+        background: rgba(37,99,235,0.12) !important;
+        border: 2px solid #2563eb !important;
+        border-radius: 12px !important;
+        font-weight: 600 !important;
+        box-shadow: 0 0 0 3px rgba(37,99,235,0.15) !important;
+    }
+    .st-key-attachpop button:hover {
+        background: rgba(37,99,235,0.22) !important;
+        box-shadow: 0 0 0 4px rgba(37,99,235,0.28) !important;
+    }
     /* AI Chat stats row: compact, with space before the chat window */
     .st-key-chatstats { margin-bottom: 1.25rem; }
     .st-key-chatstats [data-testid="stMetricValue"] { font-size: 1.35rem !important; }
@@ -112,6 +124,14 @@ st.markdown(
     [data-testid="stSidebarUserContent"] [data-testid="stVerticalBlock"] { gap: 0.5rem; }
     [data-testid="stSidebarUserContent"] hr { margin: 0.3rem 0 !important; }
     .st-key-chatopts [data-testid="stVerticalBlock"] { gap: 0.5rem; }
+    /* Compact view toggle: hides the title, model line and stats so the chat window gets the room */
+    .stApp:has(.st-key-chat_compact input:checked) .st-key-chattitle,
+    .stApp:has(.st-key-chat_compact input:checked) .st-key-chatmodel,
+    .stApp:has(.st-key-chat_compact input:checked) .st-key-chatstats { display: none !important; }
+    .stApp:has(.st-key-chat_compact input:checked) [data-testid="stLayoutWrapper"]:has(> .st-key-chatwindow) { height: calc(100vh - 235px) !important; }
+    .stApp:has(.st-key-chat_compact input:checked) .stVerticalBlock.st-key-chatwindow { height: calc(100vh - 235px) !important; max-height: calc(100vh - 235px) !important; }
+    .stApp:has(.st-key-chat_compact input:checked) [data-baseweb="tab-panel"] { padding-top: 0.25rem !important; }
+    .stApp:has(.st-key-chat_compact input:checked) [data-baseweb="tab-panel"] > [data-testid="stVerticalBlock"] { gap: 0.4rem !important; }
     /* Sidebar breathing room: headings, dividers, metric, buttons */
     .st-key-chatopts [data-testid="stMarkdownContainer"]:has(h4) { padding: 1.5rem 0 1.1rem 0; }
     [data-testid="stSidebarUserContent"] .st-key-chatopts hr { margin: 1rem 0 !important; }
@@ -175,9 +195,10 @@ with tab_synthea:
 
 # =====================================================================================
 # AI CHAT TAB: public chat with the home-hosted Qwen model (vLLM, OpenAI-compatible API)
-# Fairness: ONE reply at a time per visitor (by IP), a few messages/min per visitor.
+# Fairness: ONE reply at a time per visitor (by IP). No per-minute limit: full access for everyone, by design.
 # vLLM queues requests across visitors, so the UI shows a waiting indicator + live load.
-# Thinking is ON; reasoning streams into a collapsible box. No database/web access (yet).
+# Thinking is ON; reasoning streams into a collapsible box. With "Web search" on (default), replies come from the
+# "website" agent on agent-box (web search + page reading, no database access) via the tailnet forwarder :8100.
 # =====================================================================================
 
 
@@ -195,6 +216,17 @@ QWEN_URL = f"http://{MODEL_HOST}:8000/v1/chat/completions"
 QWEN_METRICS_URL = f"http://{MODEL_HOST}:8000/metrics"
 GPU_STATS_URL = f"http://{MODEL_HOST}:9100/gpu"
 QWEN_MODELS_URL = f"http://{MODEL_HOST}:8000/v1/models"
+# Web search mode: the Agno agent service (agent-box), reached through the same tailnet forwarder host.
+AGENT_RUN_URL = f"http://{MODEL_HOST}:8100/agents/website/runs"
+
+
+def _agent_key():
+    """Bearer key for the agent service, from the git-ignored file .agent_key (None = web search unavailable)."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), ".agent_key")) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
 QWEN_MODEL = "Qwen3.8-27B"
 GPU_COUNT, GPU_GB = 2, 24  # dual RTX 3090
 # Claude API list prices, USD per 1M tokens (input, output), from the API reference cached 2026-11-03
@@ -204,8 +236,7 @@ CLOUD_PRICES = {
     "Claude Opus 5.5": (4.00, 20.00),
     "Claude Fable 5.2": (8.00, 40.00),
 }
-CHAT_MAX_MSGS_PER_MIN = 10      # per visitor IP
-CHAT_MAX_INPUT_CHARS = 4000
+CHAT_MAX_INPUT_CHARS = 20000
 CHAT_MAX_HISTORY = 20           # most recent messages sent to the model
 CHAT_MAX_SECONDS = 600          # safety net only (10 min per reply)
 CHAT_ACTIVE_WINDOW = 600        # a visitor counts as "recent" for 10 minutes
@@ -441,6 +472,118 @@ def _qwen_stream(messages, opts=None):
                 yield ("answer", piece)
 
 
+def _agent_stream(message, session_id, user_id):
+    """Yield ("tool", label), ("answer", text), ("ctx", n), ("prompt_usage", n), ("usage", n) from the agent service.
+
+    The agent keeps the conversation itself (per session_id), so only the new message is sent."""
+    deadline = time.time() + CHAT_MAX_SECONDS
+    data = {"message": message, "stream": "true", "session_id": session_id, "user_id": user_id}
+    headers = {"Authorization": f"Bearer {_agent_key()}"}
+    with requests.post(AGENT_RUN_URL, data=data, headers=headers, stream=True, timeout=(5, CHAT_MAX_SECONDS)) as resp:
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+        last_ctx = None
+        for line in resp.iter_lines(decode_unicode=True):
+            if time.time() > deadline:
+                yield ("answer", " (reply stopped: time limit reached)")
+                return
+            if not line or not line.startswith("data: "):
+                continue
+            try:
+                obj = json.loads(line[6:])
+            except ValueError:
+                continue
+            ev = obj.get("event", "")
+            if ev == "RunContent" and obj.get("content"):
+                yield ("answer", obj["content"])
+            elif ev == "ToolCallStarted":
+                tool = obj.get("tool") or {}
+                if isinstance(tool, str):
+                    try:
+                        tool = json.loads(tool)
+                    except ValueError:
+                        tool = {}
+                name, args = tool.get("tool_name", ""), tool.get("tool_args") or {}
+                if name == "search_web":
+                    yield ("tool", f"🔎 Searching the web: {args.get('query', '')}")
+                elif name == "fetch_page":
+                    yield ("tool", f"📄 Reading {args.get('url', '')}")
+                elif name == "run_python":
+                    yield ("tool", "🐍 Running Python")
+                elif name == "list_files":
+                    yield ("tool", "📁 Checking the files")
+                else:
+                    yield ("tool", f"🛠️ {name}")
+            elif ev == "ModelRequestCompleted":
+                last_ctx = (obj.get("input_tokens") or 0) + (obj.get("output_tokens") or 0)
+            elif ev == "RunCompleted":
+                metrics = obj.get("metrics") or {}
+                if isinstance(metrics, str):
+                    try:
+                        metrics = json.loads(metrics)
+                    except ValueError:
+                        metrics = {}
+                if last_ctx:
+                    yield ("ctx", last_ctx)
+                if metrics.get("input_tokens"):
+                    yield ("prompt_usage", metrics["input_tokens"])
+                if metrics.get("output_tokens"):
+                    yield ("usage", metrics["output_tokens"])
+                return
+            elif ev.endswith("Error") or ev == "RunCancelled":
+                raise RuntimeError(obj.get("content") or ev)
+
+
+AGENT_FILES_URL = f"http://{MODEL_HOST}:8100/files"
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+CHAT_UPLOAD_TYPES = ["csv", "tsv", "xlsx", "xlsm", "xls", "pdf", "txt", "md", "json", "docx"]  # whitelist
+CHAT_UPLOAD_MB = 50  # this small AWS box holds each upload in RAM on its way through
+
+
+def _agent_headers():
+    return {"Authorization": f"Bearer {_agent_key()}"}
+
+
+def _agent_list_files(session_id):
+    """{name: size} of the files in this chat's agent workspace (empty if unreachable)."""
+    try:
+        r = requests.get(f"{AGENT_FILES_URL}/{session_id}", headers=_agent_headers(), timeout=10)
+        r.raise_for_status()
+        return {f["name"]: f["size"] for f in r.json()}
+    except Exception:
+        return {}
+
+
+def _agent_upload(session_id, uploaded):
+    """Send one uploaded file to this chat's agent workspace (/work); returns the name it was stored under."""
+    r = requests.post(f"{AGENT_FILES_URL}/{session_id}", headers=_agent_headers(),
+                      files={"file": (uploaded.name, uploaded.getvalue())}, timeout=(5, 300))
+    r.raise_for_status()
+    return r.json()["name"]
+
+
+@st.cache_data(ttl=3600, max_entries=20, show_spinner=False)
+def _agent_file_bytes(session_id, name, size):
+    r = requests.get(f"{AGENT_FILES_URL}/{session_id}/{name}", headers=_agent_headers(), timeout=(5, 120))
+    r.raise_for_status()
+    return r.content
+
+
+def _render_files(session_id, files, key):
+    """Files the agent made: images shown inline, every file downloadable (fetched only when clicked)."""
+    for i, (name, size) in enumerate(files):
+        if name.lower().endswith(IMAGE_EXT) and size <= 5 * 1024**2:
+            try:
+                st.image(_agent_file_bytes(session_id, name, size), caption=name)
+            except Exception:
+                st.caption(f"(couldn't load {name}; files are kept for 24 hours)")
+        st.download_button(
+            f"⬇️ {name} ({size / 1024:,.0f} KB)",
+            data=lambda n=name, s=size: _agent_file_bytes(session_id, n, s),
+            file_name=name, key=f"dl-{key}-{i}",
+        )
+
+
 # Thinking effort as the model server understands it (it accepts low / medium / xhigh, or thinking off)
 EFFORT_KWARGS = {
     "Off": {"enable_thinking": False},
@@ -448,7 +591,7 @@ EFFORT_KWARGS = {
     "Medium": {"reasoning_effort": "medium"},
     "Max": {"reasoning_effort": "xhigh"},
 }
-CHAT_DEFAULTS = {"chat_effort": "Low", "chat_temp": 0.6, "chat_top_p": 0.95}
+CHAT_DEFAULTS = {"chat_effort": "Low", "chat_temp": 0.6, "chat_top_p": 0.95, "chat_web": True}
 
 
 def _chat_opts():
@@ -500,7 +643,8 @@ def _hero_html(path, mtime):
 
 
 with tab_chat:
-    st.title("Chat with a self-hosted AI")
+    with st.container(key="chattitle"):
+        st.title("Chat with a self-hosted AI")
     _ms0 = _model_stats()
     _root = _ms0.get("root") if _ms0 else None
     st.container(key="chatmodel").markdown(
@@ -540,6 +684,9 @@ with tab_chat:
               help="A live fill level, not a limit: how much of the GPU memory pool that holds every active "
                    "conversation's working state is in use right now, across all visitors at once.")
 
+    st.toggle(("🔽" if st.session_state.get("chat_compact") else "🔼") + " Compact view: hide the title & stats for a bigger chat window",
+              key="chat_compact", value=False)
+
     # Framed, scrollable chat window; the input sits right below it
     chat_box = st.container(height=520, border=True, key="chatwindow")
     hero_slot = chat_box.empty()
@@ -548,18 +695,45 @@ with tab_chat:
                       if os.path.exists(f)), None)
         if _hero:
             hero_slot.markdown(_hero_html(_hero, os.path.getmtime(_hero)), unsafe_allow_html=True)
-    for m in st.session_state.chat_messages:
+    for idx, m in enumerate(st.session_state.chat_messages):
         with chat_box.chat_message(m["role"]):
+            if m.get("steps"):
+                with st.expander(f"🛠️ Used tools ({len(m['steps'])} steps)", expanded=False):
+                    st.markdown("\n".join(f"- {s}" for s in m["steps"]))
             if m.get("reasoning"):
                 with st.expander("🧠 Reasoning", expanded=False):
                     st.markdown(m["reasoning"])
             st.markdown(m["content"])
+            if m.get("attachments"):
+                st.caption("📎 " + ", ".join(m["attachments"]))
+            if m.get("files") and m.get("sid"):
+                _render_files(m["sid"], m["files"], f"msg-{idx}")
 
-    _sc, _cc = st.columns([6, 1], vertical_alignment="center")
+    _sc, _ac, _cc = st.columns([4, 2, 1], vertical_alignment="center")
     stat_slot = _sc.empty()
     _show_last_stats(stat_slot)
 
-    prompt = st.chat_input("Chat here...", max_chars=CHAT_MAX_INPUT_CHARS)
+    # Attach files: a big, obvious button beside Clear (files ride along with the next message you send)
+    _up_key = f"chat_up_{st.session_state.get('up_gen', 0)}"
+    _staged = st.session_state.get(_up_key) or []
+    with _ac.popover(
+        f"Attach files ({len(_staged)})" if _staged else "Attach files", icon="📎", width="stretch", key="attachpop",
+        help="Upload spreadsheets, CSVs or other files. The assistant can analyse them and make charts.",
+    ):
+        st.markdown("**📎 Attach a spreadsheet, CSV or other file**")
+        st.caption("The assistant can read it, run Python on it, and build charts. Then type your question below "
+                   "and send: your files go along with that message. "
+                   "Accepted: " + ", ".join(f".{t}" for t in CHAT_UPLOAD_TYPES) + ".")
+        st.file_uploader("Choose files", type=CHAT_UPLOAD_TYPES, accept_multiple_files=True, key=_up_key, max_upload_size=CHAT_UPLOAD_MB,
+                         label_visibility="collapsed")
+        if not st.session_state.get("chat_web", True):
+            st.warning("Turn on 🛠️ Tools in the sidebar for the assistant to use your files.")
+
+    chat_in = st.chat_input(
+        "Chat here... (use the 📎 paperclip above to attach spreadsheets, PDFs, or other file types)", max_chars=CHAT_MAX_INPUT_CHARS,
+    )
+    prompt = (chat_in or "").strip() if chat_in else ""
+    attachments = list(_staged) if prompt else []
 
     if prompt:
         hero_slot.empty()  # image disappears the moment a message is sent
@@ -570,11 +744,8 @@ with tab_chat:
             for k in [k for k, v in reg["busy"].items() if now_ts - v > CHAT_MAX_SECONDS + 60]:
                 del reg["busy"][k]  # stale entry safety net
             recent = [t for t in reg["times"].get(cid, []) if now_ts - t < 60]
-            if not admin:
-                if cid in reg["busy"]:
-                    verdict = ("busy", 0)
-                elif len(recent) >= CHAT_MAX_MSGS_PER_MIN:
-                    verdict = ("rate", int(60 - (now_ts - recent[0])) + 1)
+            if not admin and cid in reg["busy"]:  # one reply at a time per visitor (no per-minute limit)
+                verdict = ("busy", 0)
             if verdict is None:
                 recent.append(now_ts)
                 reg["times"][cid] = recent
@@ -583,19 +754,39 @@ with tab_chat:
 
         if verdict and verdict[0] == "busy":
             st.info("You already have a reply in progress. Please wait for it to finish.")
-        elif verdict and verdict[0] == "rate":
-            st.warning(f"Easy there: {CHAT_MAX_MSGS_PER_MIN} messages per minute max. Try again in about {verdict[1]}s.")
         else:
+            use_agent = False
             try:
-                st.session_state.chat_messages.append({"role": "user", "content": prompt})
+                names = [f.name for f in attachments]
+                st.session_state.chat_messages.append({"role": "user", "content": prompt, "attachments": names})
                 with chat_box.chat_message("user"):
                     st.markdown(prompt)
+                    if names:
+                        st.caption("📎 " + ", ".join(names))
 
                 history = [
                     {"role": m["role"], "content": m["content"]}
                     for m in st.session_state.chat_messages[-CHAT_MAX_HISTORY:]
                 ]
                 messages = [{"role": "system", "content": st.session_state.get("system_prompt") or CHAT_SYSTEM_PROMPT}] + history
+                # Web search mode goes through the agent service; a custom system prompt needs the direct path.
+                custom_prompt = st.session_state.get("system_prompt") not in (None, CHAT_SYSTEM_PROMPT)
+                use_agent = st.session_state.get("chat_web", True) and not custom_prompt and _agent_key() is not None
+                agent_sid, uploaded, before = None, [], {}
+                if use_agent:
+                    agent_sid = f"web-{cid}-{st.session_state.setdefault('agent_sid', os.urandom(4).hex())}"
+                    for f in attachments:
+                        try:
+                            uploaded.append(_agent_upload(agent_sid, f))
+                        except Exception:
+                            st.warning(f"Couldn't upload {f.name}.")
+                    before = _agent_list_files(agent_sid)
+                    message = prompt + (f"\n\n[Files uploaded to /work: {', '.join(uploaded)}]" if uploaded else "")
+                    stream = _agent_stream(message, agent_sid, cid)
+                else:
+                    if attachments:
+                        st.warning("Files need 🛠️ Tools turned on (sidebar); this message was sent without them.")
+                    stream = _qwen_stream(messages, _chat_opts())
 
                 with chat_box.chat_message("assistant"):
                     status = st.status("⏳ Waiting for the model...", expanded=False)
@@ -606,13 +797,25 @@ with tab_chat:
                     first_tok, n_chunks, usage_tokens, prompt_tokens, ans_t = None, 0, None, None, None
                     last_paint = 0.0
                     thinking_shown = False
+                    steps, agent_ctx = [], None
                     try:
-                        for kind, piece in _qwen_stream(messages, _chat_opts()):
+                        for kind, piece in stream:
                             if kind == "usage":
                                 usage_tokens = piece
                                 continue
                             if kind == "prompt_usage":
                                 prompt_tokens = piece
+                                continue
+                            if kind == "ctx":
+                                agent_ctx = piece
+                                continue
+                            if kind == "tool":
+                                # A web step: show it, and drop text streamed before it (narration like "I'll search...")
+                                steps.append(piece)
+                                status.update(label=piece)
+                                think_box.markdown("\n".join(f"- {s}" for s in steps))
+                                answer, first_tok, n_chunks = "", None, 0
+                                answer_box.empty()
                                 continue
                             if first_tok is None:
                                 first_tok = time.time()
@@ -627,10 +830,14 @@ with tab_chat:
                                     last_paint = time.time()
                             else:
                                 if not answer:
-                                    think_box.markdown(reasoning)
+                                    if reasoning:
+                                        think_box.markdown(reasoning)
                                     ans_t = time.time()
                                     secs = int(ans_t - started)
-                                    status.update(label=(f"🧠 Thought for {secs}s" if thinking_shown else "💬 Replying"), state="complete", expanded=False)
+                                    label = (f"🧠 Thought for {secs}s" if thinking_shown
+                                             else f"🛠️ Used tools ({len(steps)} steps, {secs}s)" if steps
+                                             else "💬 Replying")
+                                    status.update(label=label, state="complete", expanded=False)
                                 answer += piece
                                 if time.time() - last_paint > 0.05:
                                     answer_box.markdown(answer + " ▌")
@@ -653,23 +860,42 @@ with tab_chat:
                             st.session_state.cloud_out = st.session_state.get("cloud_out", 0) + usage_tokens
                             _add_tokens(prompt_tokens, usage_tokens)
                             _show_served(tokens_slot)
+                        if agent_ctx:  # the agent's last model call is the real context size, not the run total
+                            st.session_state.ctx_used = agent_ctx
+                            _show_ctx(ctx_slot, ms["ctx"] if ms else None)
                         if not answer:
                             raise ValueError("empty answer")
+                        new_files = []
+                        if use_agent:  # files the agent created or changed this turn (charts, cleaned data, ...)
+                            after = _agent_list_files(agent_sid)
+                            new_files = [(n, s) for n, s in sorted(after.items())
+                                         if before.get(n) != s and n not in uploaded]
+                            if new_files:
+                                _render_files(agent_sid, new_files, f"live-{len(st.session_state.chat_messages)}")
                         st.session_state.chat_messages.append(
-                            {"role": "assistant", "content": answer, "reasoning": reasoning}
+                            {"role": "assistant", "content": answer, "reasoning": reasoning, "steps": steps,
+                             "files": new_files, "sid": agent_sid}
                         )
                     except Exception:
                         st.session_state.chat_messages.pop()  # drop the unanswered user message
                         status.update(label="⚠️ No reply", state="error", expanded=False)
-                        st.error("The model didn't return an answer (it may be unreachable or hit its limit). Please try again.")
+                        if use_agent:
+                            st.error("The assistant didn't return an answer. Please try again, or turn off "
+                                     "🌐 Web search in the sidebar to chat with the model directly.")
+                        else:
+                            st.error("The model didn't return an answer (it may be unreachable or hit its limit). Please try again.")
             finally:
                 with reg["lock"]:
                     reg["busy"].pop(busy_key, None)
+            if attachments:  # files were sent with this message: start the next one with an empty tray
+                st.session_state["up_gen"] = st.session_state.get("up_gen", 0) + 1
+                if use_agent:
+                    st.rerun()
 
     if _cc.button("🧹 Clear", key="clear_chat", disabled=not st.session_state.chat_messages, width="stretch"):
         st.session_state.chat_messages = []
         st.session_state.ctx_used = 0
-        for _k in ("last_stats", "cloud_in", "cloud_out"):
+        for _k in ("last_stats", "cloud_in", "cloud_out", "agent_sid"):  # new agent session = fresh memory
             st.session_state.pop(_k, None)
         st.rerun()
 
@@ -1044,6 +1270,12 @@ with tab_dash:
 with st.sidebar.container(key="chatopts"):
     st.divider()
     st.markdown("#### 💬 Chat settings")
+    st.toggle(
+        "🛠️ Tools (web, Python, files)", value=CHAT_DEFAULTS["chat_web"], key="chat_web",
+        help="On: an agent can search the web, read pages, and run Python on files you attach (spreadsheets, CSVs) "
+             "to analyse them and make charts. Thinking effort, temperature and a custom system prompt don't apply. "
+             "Off: chat with the model directly.",
+    )
     if st.button("📝 System prompt", width="stretch", key="sysprompt_btn"):
         _system_prompt_dialog()
     st.select_slider(
@@ -1062,26 +1294,4 @@ with st.sidebar.container(key="chatopts"):
         help="Only sample from the smallest set of words whose probabilities add up to this value.",
     )
     st.divider()
-    st.markdown("#### 💵 Cost estimate")
-    _tier = st.selectbox(
-        "Compare against", list(CLOUD_PRICES), index=1, key="cloud_tier",
-        help="Which paid Claude model to price this chat against (list prices per million tokens).",
-    )
-    _rin, _rout = CLOUD_PRICES[_tier]
-    st.markdown(
-        '<div style="font-size:0.85rem;opacity:0.7;line-height:1.5;padding-bottom:1.1rem">'
-        f'In: &#36;{_rin / 1e6:.7f} / token<br>Out: &#36;{_rout / 1e6:.7f} / token</div>',
-        unsafe_allow_html=True,
-    )
-    _cost = (st.session_state.get("cloud_in", 0) * _rin + st.session_state.get("cloud_out", 0) * _rout) / 1e6
-    st.metric(
-        "💵 Estimated cost (this chat)", _fmt_usd(_cost),
-        help=f"What this conversation's tokens would cost on {_tier} at &#36;{_rin:.2f} in / &#36;{_rout:.2f} out per million tokens. "
-             "Here there are no per-token fees, just electricity.",
-    )
-    st.markdown(
-        '<div style="font-size:0.85rem;opacity:0.7;line-height:1.5;padding-bottom:1.1rem">This conversation<br>'
-        f'In: {st.session_state.get("cloud_in", 0):,} tokens<br>Out: {st.session_state.get("cloud_out", 0):,} tokens</div>',
-        unsafe_allow_html=True,
-    )
     st.button("↩️ Reset chat settings", width="stretch", on_click=_reset_chat_opts, key="reset_chat_btn")
