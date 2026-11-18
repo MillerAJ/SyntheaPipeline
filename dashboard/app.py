@@ -34,7 +34,14 @@ st.markdown(
         padding: 16px;
         text-align: center;
         transition: transform 0.2s ease, box-shadow 0.2s ease;
-        margin-bottom: 10px;
+        margin-bottom: 0;
+        height: 80px;
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        line-height: 1.3;
+        font-family: inherit;
     }
     .nav-card:hover {
         transform: translateY(-2px);
@@ -44,17 +51,36 @@ st.markdown(
     .nav-card a {
         text-decoration: none;
         color: #0f172a;
-        font-weight: 600;
-        font-size: 1.05rem;
+        font-weight: 400;
+        font-size: 16.8px;
         display: block;
+        font-family: inherit;
+        line-height: 1.3;
     }
     .nav-sub {
-        font-size: 0.85rem;
+        font-weight: 400;
+        font-size: 13.6px;
         color: #64748b;
         margin-top: 4px;
+        line-height: 1.3;
     }
+    /* Pipeline steps: scale the heading with the width, only ever wrap between words */
+    .st-key-pipeheads h3 {
+        font-size: clamp(1.1rem, 2.1vw, 1.75rem) !important;
+        line-height: 1.25 !important;
+    }
+    .st-key-pipeheads h3, .st-key-pipeheads h3 * {
+        word-break: normal !important;
+        overflow-wrap: normal !important;
+        hyphens: none !important;
+    }
+    .st-key-pipeheads { margin-bottom: -0.6rem; }
     /* Top tabs: larger, with big emoji, and closer to the top */
-    .block-container { padding-top: 2rem !important; }
+    .block-container { padding-top: 0.5rem !important; }
+    /* the toolbar strip overlaps the tabs now: let clicks pass through it, keep its own buttons live */
+    [data-testid="stHeader"] { pointer-events: none; background: transparent !important; }
+    [data-testid="stToolbar"], [data-testid="stToolbar"] *, [data-testid="stSidebarCollapsedControl"],
+    [data-testid="stSidebarCollapsedControl"] *, [data-testid="stExpandSidebarButton"], [data-testid="stStatusWidget"] { pointer-events: auto; }
     .stTabs [data-baseweb="tab-list"] { gap: 14px; }
     .stTabs [data-baseweb="tab"] { height: 3.6rem; padding: 0 24px; }
     .stTabs [data-baseweb="tab"] p,
@@ -96,7 +122,7 @@ st.markdown(
     .st-key-chatmodel { position: relative; z-index: 2; }
     .st-key-chatmodel p { font-size: 1.3rem !important; margin: 0 !important; }
     .st-key-chatmodel code { font-size: 1.1rem !important; }
-    .st-key-chatstats { margin-top: -3rem; }
+    .st-key-chatstats { margin-top: 0.5rem; }  /* always below the model links, never overlapping */
     /* Sidebar social links: same icon size, same left edge, soft white text in dark mode */
     .side-link {
         display: flex; align-items: center; gap: 0.6rem;
@@ -148,7 +174,7 @@ st.markdown(
 
 
 # ---- Tabs (client-side switching; sidebar stays put) ----
-tab_dash, tab_chat, tab_synthea = st.tabs(["📊 Dashboard", "💬 AI Chat", "🩺 What is Synthea"])
+tab_dash, tab_chat, tab_synthea = st.tabs(["📊 Pipeline Dashboard", "💬 AI Chat", "🩺 What is Synthea?"])
 
 with tab_synthea:
     st.title("What is Synthea?")
@@ -197,8 +223,8 @@ with tab_synthea:
 # AI CHAT TAB: public chat with the home-hosted Qwen model (vLLM, OpenAI-compatible API)
 # Fairness: ONE reply at a time per visitor (by IP). No per-minute limit: full access for everyone, by design.
 # vLLM queues requests across visitors, so the UI shows a waiting indicator + live load.
-# Thinking is ON; reasoning streams into a collapsible box. With "Web search" on (default), replies come from the
-# "website" agent on agent-box (web search + page reading, no database access) via the tailnet forwarder :8100.
+# Replies come from the "website" agent on agent-box (web search, page reading, Python on uploads) via the tailnet
+# forwarder :8100. A custom system prompt (or a missing agent key) falls back to the direct vLLM path, no tools.
 # =====================================================================================
 
 
@@ -240,16 +266,10 @@ CHAT_MAX_INPUT_CHARS = 20000
 CHAT_MAX_HISTORY = 20           # most recent messages sent to the model
 CHAT_MAX_SECONDS = 600          # safety net only (10 min per reply)
 CHAT_ACTIVE_WINDOW = 600        # a visitor counts as "recent" for 10 minutes
-CHAT_SYSTEM_PROMPT = (
-    "You are the AI assistant on a portfolio website that showcases a synthetic-healthcare data "
-    "engineering pipeline. You run as Qwen3.8-27B (4-bit AWQ, served by vLLM) on a private home server with two NVIDIA RTX 3090 GPUs, not in the cloud. About the project: "
-    "Synthea generates synthetic patient data (FHIR JSON); it is loaded into PostgreSQL; dbt "
-    "transforms it into structured tables; the tables are pushed to Snowflake; Airflow orchestrates "
-    "the workflow, Marquez tracks data lineage, Metabase is used to explore the data, and this "
-    "dashboard is built with Streamlit. All patient data is synthetic: no real people and no real "
-    "PHI. You do NOT have access to the database, live metrics, or the internet, so never claim to "
-    "look anything up or invent figures; for live numbers, point to the Dashboard tab. Be friendly, "
-    "concise and accurate. Do not give medical advice. If you do not know, say so."
+CHAT_SYSTEM_PROMPT = (  # keep in sync with WEBSITE_PROMPT in agent-box /opt/agno/app/service.py
+    "You are a helpful assistant on a website about a synthetic healthcare data pipeline. Your tools: web search "
+    "and page reading, a Python sandbox for analysis and charts, files the user uploads, and read-only SQL on the "
+    "project's Snowflake database (synthetic patients). Use them when they help. Be brief."
 )
 
 
@@ -301,32 +321,30 @@ def _gpu_stats():
 
 
 def _vram_html(gpus):
-    """Two stacked bars: GB used vs total for each card."""
+    """Temperature (°F) and GB used vs total for each card (text only)."""
     parts = ['<div style="font-size:0.875rem;opacity:0.7">🎮 GPU VRAM</div>']
     for g in gpus:
         used, total = g["used_mib"] / 1024, g["total_mib"] / 1024
-        pct = 100 * used / total if total else 0
+        temp = f'{g["temp_c"] * 9 / 5 + 32:.0f}°F' if g.get("temp_c") is not None else "n/a"
         parts.append(
-            f'<div style="display:flex;justify-content:space-between;font-size:0.9rem;margin-top:6px">'
-            f'<span>GPU {g["index"] + 1}</span><span><b>{used:.1f}</b> / {total:.1f} GB</span></div>'
-            f'<div style="height:9px;border-radius:5px;background:rgba(128,128,128,0.25);overflow:hidden">'
-            f'<div style="width:{pct:.0f}%;height:100%;background:#2563eb"></div></div>'
+            f'<div style="display:flex;gap:0.6rem;font-size:0.9rem;margin-top:6px">'
+            f'<span>GPU {g["index"] + 1}</span><span><b>{temp}</b> · {used:.1f} / {total:.1f} GB</span></div>'
         )
-    return '<div style="padding-bottom:24px">' + "".join(parts) + "</div>"  # lift so the bars line up with the other values
+    return "<div>" + "".join(parts) + "</div>"
 
 
 def _show_ctx(slot, ctx_max):
-    """Tokens in this visitor's conversation (prompt + latest reply) out of the model's window."""
+    """Tokens in this visitor's conversation, shown raw, with the change from the latest reply."""
     used = st.session_state.get("ctx_used", 0)
     if ctx_max:
         slot.metric(
-            "📏 Context Window (tokens)",
-            f"{used:,} / {ctx_max // 1024}K ({used / ctx_max * 100:.1f}%)",
-            help=f"Tokens your conversation occupies out of the model's {ctx_max:,}-token window "
-                 "(system prompt + chat history + the latest reply). A fixed ceiling per chat.",
+            f"📏 Context used (of {ctx_max // 1024}K)",
+            f"{used:,} ({used / ctx_max * 100:.1f}%)",
+            help=f"{used:,} of the model's {ctx_max:,}-token window: tool definitions, chat history and the latest "
+                 "reply. Web searches, database results and long replies add the most.",
         )
     else:
-        slot.metric("📏 Context Window (tokens)", "n/a")
+        slot.metric("📏 Context used", "n/a")
 
 
 TOKENS_FILE = ".tokens_served.json"  # tokens served through THIS site only (not the shared model server)
@@ -369,8 +387,8 @@ def _show_served(slot):
     cost = (life["prompt"] * rin + life["gen"] * rout) / 1e6
     since = time.strftime("%b %d", time.localtime(life["since"]))
     slot.metric(
-        "🪙 All Time Tokens (In/Out)", f'{_compact(life["prompt"])} / {_compact(life["gen"])}',
-        help=f"Tokens in / tokens out (prompt / generated) handled by this site's chat since {since}, across all visitors "
+        "🪙 All Time Tokens", _compact(life["prompt"] + life["gen"]),
+        help=f"Total tokens (prompt + generated) handled by this site's chat since {since}, across all visitors "
              f"({life['replies']:,} replies). Roughly {_fmt_usd(cost)} on {tier}; no per-token fees here.",
     )
 
@@ -396,7 +414,7 @@ def _show_last_stats(slot):
         f"{ls['tokens']:,} tokens",
         f"{ls['speed']:.0f} tok/s",
         f"{ls['ttft']:.1f}s to first token",
-        f"thought {ls['thought']:.1f}s" if ls["thinking"] else "thinking off",
+        *([f"thought {ls['thought']:.1f}s"] if ls["thinking"] else []),
         f"{ls['total']:.1f}s total",
     ]
     slot.caption("🧾 Last reply: " + " · ".join(parts))
@@ -534,10 +552,25 @@ def _agent_stream(message, session_id, user_id):
                 raise RuntimeError(obj.get("content") or ev)
 
 
+def _steps_md(steps):
+    """Tool steps are strings; the model's notes between them are {"note": text} (shown as quotes)."""
+    out = []
+    for s in steps:
+        if isinstance(s, dict):
+            out.append("\n".join("> " + ln for ln in ("💭 " + s["note"]).splitlines()))
+        else:
+            out.append(f"- {s}")
+    return "\n\n".join(out)
+
+
+def _tool_count(steps):
+    return sum(1 for s in steps if not isinstance(s, dict))
+
+
 AGENT_FILES_URL = f"http://{MODEL_HOST}:8100/files"
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 CHAT_UPLOAD_TYPES = ["csv", "tsv", "xlsx", "xlsm", "xls", "pdf", "txt", "md", "json", "docx"]  # whitelist
-CHAT_UPLOAD_MB = 50  # this small AWS box holds each upload in RAM on its way through
+CHAT_UPLOAD_MB = 100  # this small AWS box holds each upload in RAM on its way through
 
 
 def _agent_headers():
@@ -569,6 +602,15 @@ def _agent_file_bytes(session_id, name, size):
     return r.content
 
 
+# The agent sometimes writes ![chart](/work/x.png) into its answer. Browsers can't load the sandbox path, so those
+# links are removed from the text; the real images are shown below the answer by _render_files. Web images stay.
+_LOCAL_IMG_MD = re.compile(r"!\[[^\]]*\]\((?!\s*(?:https?:|data:))[^)]*\)")
+
+
+def _clean_answer(text):
+    return _LOCAL_IMG_MD.sub("", text or "")
+
+
 def _render_files(session_id, files, key):
     """Files the agent made: images shown inline, every file downloadable (fetched only when clicked)."""
     for i, (name, size) in enumerate(files):
@@ -591,7 +633,7 @@ EFFORT_KWARGS = {
     "Medium": {"reasoning_effort": "medium"},
     "Max": {"reasoning_effort": "xhigh"},
 }
-CHAT_DEFAULTS = {"chat_effort": "Low", "chat_temp": 0.6, "chat_top_p": 0.95, "chat_web": True}
+CHAT_DEFAULTS = {"chat_effort": "Low", "chat_temp": 0.6, "chat_top_p": 0.95}
 
 
 def _chat_opts():
@@ -612,7 +654,8 @@ def _reset_chat_opts():
 
 @st.dialog("📝 System prompt", width="large")
 def _system_prompt_dialog():
-    st.caption("The instructions the model follows for every reply. Changes apply to your session only.")
+    st.caption("Editing this switches your session to a direct chat with the model: no web search, Python or "
+               "files. Changes apply to your session only; Reset to default brings the tools back.")
     txt = st.text_area(
         "System prompt",
         value=st.session_state.get("system_prompt", CHAT_SYSTEM_PROMPT),
@@ -669,9 +712,10 @@ with tab_chat:
         recent_visitors = len(reg["seen"])
     ms = _model_stats()
     gpus = _gpu_stats()
-    c1, c2, c3, c4, _gap, c5 = st.container(key="chatstats").columns([1, 1.65, 1.85, 1.6, 0.15, 1.1], vertical_alignment="bottom")
+    c1, c2, c3, c4 = st.container(key="chatstats").columns([1, 1.65, 1.3, 1.85], vertical_alignment="bottom")
     c1.metric("👥 Active users", recent_visitors,
-              help=f"Visitors who chatted in the last {CHAT_ACTIVE_WINDOW // 60} minutes")
+              help=f"Visitors who chatted in the last {CHAT_ACTIVE_WINDOW // 60} minutes. Multiple users will "
+                   "slow response times.")
     ctx_slot = c2.empty()
     _show_ctx(ctx_slot, ms["ctx"] if ms else None)
     tokens_slot = c3.empty()
@@ -680,9 +724,6 @@ with tab_chat:
         c4.markdown(_vram_html(gpus), unsafe_allow_html=True)
     else:
         c4.metric("🎮 GPU VRAM", "n/a")
-    c5.metric("🧠 KV cache in use", f"{ms['kv'] * 100:.0f}%" if ms and ms["kv"] is not None else "n/a",
-              help="A live fill level, not a limit: how much of the GPU memory pool that holds every active "
-                   "conversation's working state is in use right now, across all visitors at once.")
 
     st.toggle(("🔽" if st.session_state.get("chat_compact") else "🔼") + " Compact view: hide the title & stats for a bigger chat window",
               key="chat_compact", value=False)
@@ -698,12 +739,12 @@ with tab_chat:
     for idx, m in enumerate(st.session_state.chat_messages):
         with chat_box.chat_message(m["role"]):
             if m.get("steps"):
-                with st.expander(f"🛠️ Used tools ({len(m['steps'])} steps)", expanded=False):
-                    st.markdown("\n".join(f"- {s}" for s in m["steps"]))
+                with st.expander(f"🛠️ Used tools ({_tool_count(m['steps'])} steps)", expanded=False):
+                    st.markdown(_steps_md(m["steps"]))
             if m.get("reasoning"):
                 with st.expander("🧠 Reasoning", expanded=False):
                     st.markdown(m["reasoning"])
-            st.markdown(m["content"])
+            st.markdown(_clean_answer(m["content"]) if m["role"] == "assistant" else m["content"])
             if m.get("attachments"):
                 st.caption("📎 " + ", ".join(m["attachments"]))
             if m.get("files") and m.get("sid"):
@@ -726,8 +767,9 @@ with tab_chat:
                    "Accepted: " + ", ".join(f".{t}" for t in CHAT_UPLOAD_TYPES) + ".")
         st.file_uploader("Choose files", type=CHAT_UPLOAD_TYPES, accept_multiple_files=True, key=_up_key, max_upload_size=CHAT_UPLOAD_MB,
                          label_visibility="collapsed")
-        if not st.session_state.get("chat_web", True):
-            st.warning("Turn on 🛠️ Tools in the sidebar for the assistant to use your files.")
+        if st.session_state.get("system_prompt") not in (None, CHAT_SYSTEM_PROMPT):
+            st.warning("You're using a custom system prompt, which chats with the model directly without tools. "
+                       "Reset it (📝 System prompt in the sidebar) for the assistant to use your files.")
 
     chat_in = st.chat_input(
         "Chat here... (use the 📎 paperclip above to attach spreadsheets, PDFs, or other file types)", max_chars=CHAT_MAX_INPUT_CHARS,
@@ -771,7 +813,7 @@ with tab_chat:
                 messages = [{"role": "system", "content": st.session_state.get("system_prompt") or CHAT_SYSTEM_PROMPT}] + history
                 # Web search mode goes through the agent service; a custom system prompt needs the direct path.
                 custom_prompt = st.session_state.get("system_prompt") not in (None, CHAT_SYSTEM_PROMPT)
-                use_agent = st.session_state.get("chat_web", True) and not custom_prompt and _agent_key() is not None
+                use_agent = not custom_prompt and _agent_key() is not None
                 agent_sid, uploaded, before = None, [], {}
                 if use_agent:
                     agent_sid = f"web-{cid}-{st.session_state.setdefault('agent_sid', os.urandom(4).hex())}"
@@ -785,7 +827,7 @@ with tab_chat:
                     stream = _agent_stream(message, agent_sid, cid)
                 else:
                     if attachments:
-                        st.warning("Files need 🛠️ Tools turned on (sidebar); this message was sent without them.")
+                        st.warning("A custom system prompt chats without tools, so this message was sent without your files.")
                     stream = _qwen_stream(messages, _chat_opts())
 
                 with chat_box.chat_message("assistant"):
@@ -793,6 +835,7 @@ with tab_chat:
                     think_box = status.empty()
                     answer_box = st.empty()
                     reasoning, answer = "", ""
+                    _ctx_before = st.session_state.get("ctx_used", 0)
                     started = time.time()
                     first_tok, n_chunks, usage_tokens, prompt_tokens, ans_t = None, 0, None, None, None
                     last_paint = 0.0
@@ -810,10 +853,12 @@ with tab_chat:
                                 agent_ctx = piece
                                 continue
                             if kind == "tool":
-                                # A web step: show it, and drop text streamed before it (narration like "I'll search...")
+                                # A web step: move text streamed before it (the model's notes) into the steps box
+                                if answer.strip():
+                                    steps.append({"note": answer.strip()})
                                 steps.append(piece)
                                 status.update(label=piece)
-                                think_box.markdown("\n".join(f"- {s}" for s in steps))
+                                think_box.markdown(_steps_md(steps))
                                 answer, first_tok, n_chunks = "", None, 0
                                 answer_box.empty()
                                 continue
@@ -835,14 +880,14 @@ with tab_chat:
                                     ans_t = time.time()
                                     secs = int(ans_t - started)
                                     label = (f"🧠 Thought for {secs}s" if thinking_shown
-                                             else f"🛠️ Used tools ({len(steps)} steps, {secs}s)" if steps
+                                             else f"🛠️ Used tools ({_tool_count(steps)} steps, {secs}s)" if steps
                                              else "💬 Replying")
                                     status.update(label=label, state="complete", expanded=False)
                                 answer += piece
                                 if time.time() - last_paint > 0.05:
-                                    answer_box.markdown(answer + " ▌")
+                                    answer_box.markdown(_clean_answer(answer) + " ▌")
                                     last_paint = time.time()
-                        answer_box.markdown(answer)
+                        answer_box.markdown(_clean_answer(answer))
                         gen_secs = time.time() - first_tok if first_tok else 0
                         toks = usage_tokens or n_chunks
                         if gen_secs > 0.2 and toks:
@@ -863,6 +908,8 @@ with tab_chat:
                         if agent_ctx:  # the agent's last model call is the real context size, not the run total
                             st.session_state.ctx_used = agent_ctx
                             _show_ctx(ctx_slot, ms["ctx"] if ms else None)
+                        st.session_state.ctx_inc = st.session_state.get("ctx_used", 0) - _ctx_before
+                        _show_ctx(ctx_slot, ms["ctx"] if ms else None)
                         if not answer:
                             raise ValueError("empty answer")
                         new_files = []
@@ -880,8 +927,7 @@ with tab_chat:
                         st.session_state.chat_messages.pop()  # drop the unanswered user message
                         status.update(label="⚠️ No reply", state="error", expanded=False)
                         if use_agent:
-                            st.error("The assistant didn't return an answer. Please try again, or turn off "
-                                     "🌐 Web search in the sidebar to chat with the model directly.")
+                            st.error("The assistant didn't return an answer. Please try again.")
                         else:
                             st.error("The model didn't return an answer (it may be unreachable or hit its limit). Please try again.")
             finally:
@@ -895,7 +941,7 @@ with tab_chat:
     if _cc.button("🧹 Clear", key="clear_chat", disabled=not st.session_state.chat_messages, width="stretch"):
         st.session_state.chat_messages = []
         st.session_state.ctx_used = 0
-        for _k in ("last_stats", "cloud_in", "cloud_out", "agent_sid"):  # new agent session = fresh memory
+        for _k in ("last_stats", "cloud_in", "cloud_out", "agent_sid", "ctx_inc"):  # new agent session = fresh memory
             st.session_state.pop(_k, None)
         st.rerun()
 
@@ -905,23 +951,24 @@ with tab_dash:
     st.write("") # Spacing
 
     # Create 4 columns for the 4 steps
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.markdown("### 💻 **Synthea**")
-        st.info("Synthea generates synthetic healthcare data as JSON files")
-
-    with col2:
-        st.markdown("### 🗄️  **PostgreSQL**")
-        st.info("Raw JSON is loaded into a PostgreSQL database")
-
-    with col3:
-        st.markdown("### 🔄 **dbt Transformation**")
-        st.info("dbt is used to convert raw JSON into structured tables")
-
-    with col4:
-        st.markdown("### ❄️  **Snowflake**")
-        st.info("Flattened tables are pushed to Snowflake for long-term storage")
+    _step_heads = [
+        '### 💻 **Synthea**',
+        '### 🗄️  **PostgreSQL**',
+        '### 🔄 **dbt Transformation**',
+        '### ❄️  **Snowflake**',
+    ]
+    _step_infos = [
+        'Synthea generates synthetic healthcare data as JSON files',
+        'Raw JSON is loaded into a PostgreSQL database',
+        'dbt is used to convert raw JSON into structured tables',
+        'Flattened tables are pushed to Snowflake for long-term storage',
+    ]
+    with st.container(key="pipeheads"):
+        for _c, _t in zip(st.columns(4), _step_heads):
+            _c.markdown(_t)
+    with st.container(key="pipeinfo"):
+        for _c, _t in zip(st.columns(4), _step_infos):
+            _c.info(_t)
 
     st.divider()
     #----------------------------------------------------------
@@ -1101,8 +1148,15 @@ with tab_dash:
     with col_nav1:
         metabase_card_html = """
         <style>
+            html, body { margin: 0; }
             .mb-btn {
                 width: 100%;
+                height: 80px;
+                box-sizing: border-box;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                line-height: 1.3;
                 background-color: #f8f9fa;
                 border: 1px solid #e2e8f0;
                 border-radius: 8px;
@@ -1119,22 +1173,39 @@ with tab_dash:
             }
             .mb-title {
                 color: #0f172a;
-                font-weight: 600;
-                font-size: 1.05rem;
+                font-weight: 400;
+                font-size: 16.8px;
             }
             .mb-sub {
-                font-size: 0.85rem;
+                font-weight: 400;
+                font-size: 13.6px;
                 color: #64748b;
                 margin-top: 4px;
+                line-height: 1.3;
             }
         </style>
 
         <button class="mb-btn" id="mb-btn" onclick="launchMetabase()">
-            <div class="mb-title" id="mb-title">Explore Database (Metabase)</div>
+            <div class="mb-title" id="mb-title">Explore Databases (Metabase)</div>
             <div class="mb-sub">/metabase-login</div>
         </button>
 
         <script>
+        try {
+            // An iframe doesn't inherit the page's font: copy the family and its @font-face rules from the parent
+            const pd = window.parent.document;
+            document.body.style.fontFamily = window.parent.getComputedStyle(pd.body).fontFamily;
+            let faces = "";
+            for (const sh of pd.styleSheets) {
+                try {
+                    for (const r of sh.cssRules) { if (r.type === CSSRule.FONT_FACE_RULE) faces += r.cssText; }
+                } catch (e) {}
+            }
+            const fs = document.createElement("style");
+            fs.textContent = faces;
+            document.head.appendChild(fs);
+        } catch (e) {}
+
         async function launchMetabase() {
             const btnTitle = document.getElementById("mb-title");
             btnTitle.innerText = "Authenticating...";
@@ -1160,7 +1231,7 @@ with tab_dash:
         }
         </script>
         """
-        components.html(metabase_card_html, height=85)
+        components.html(metabase_card_html, height=80)
 
     with col_nav2:
         st.markdown(
@@ -1191,13 +1262,22 @@ with tab_dash:
 
     # Row 1: High Level Counts
     r1_col1, r1_col2, r1_col3 = st.columns(3)
-    r1_col1.metric("Tables in Schema", f"{metrics.get('total_tables', 0):,}")
-    r1_col2.metric("Unique Patients", f"{metrics.get('unique_patients', 0):,}")
-    r1_col3.metric("Unique Claims", f"{metrics.get('unique_claims', 0):,}")
+    def _money(v):
+        return f"${v / 1e9:,.2f}B" if v is not None else "refresh to load"
+
+    _py = metrics.get("patient_years")
+    r1_col1.metric("Unique Patients", f"{metrics.get('unique_patients', 0):,}")
+    r1_col2.metric("Total Charges", _money(metrics.get("total_charges")),
+                   help="Everything billed: the sum of every claim's total, counted once per claim.")
+    r1_col3.metric("Total Payments", _money(metrics.get("total_payments")),
+                   help="What insurers paid: the sum of the payment amount on every explanation of benefit, "
+                        "counted once each.")
 
     # Row 2: Event Details & Total Rows
     r2_col1, r2_col2, r2_col3 = st.columns(3)
-    r2_col1.metric("Unique Medications", f"{metrics.get('unique_medications', 0):,}")
+    r2_col1.metric("Patient-Years of History", f"{_py / 1e6:,.2f}M" if _py is not None else "refresh to load",
+                   help="Every patient's age today (or at death) added together: the total years of medical "
+                        "history simulated.")
     r2_col2.metric("Encounters + Procedures", f"{metrics.get('encounters_plus_procedures', 0):,}")
     r2_col3.metric("Total Rows (All Tables)", f"{metrics.get('total_rows', 0):,}")
 
@@ -1270,12 +1350,6 @@ with tab_dash:
 with st.sidebar.container(key="chatopts"):
     st.divider()
     st.markdown("#### 💬 Chat settings")
-    st.toggle(
-        "🛠️ Tools (web, Python, files)", value=CHAT_DEFAULTS["chat_web"], key="chat_web",
-        help="On: an agent can search the web, read pages, and run Python on files you attach (spreadsheets, CSVs) "
-             "to analyse them and make charts. Thinking effort, temperature and a custom system prompt don't apply. "
-             "Off: chat with the model directly.",
-    )
     if st.button("📝 System prompt", width="stretch", key="sysprompt_btn"):
         _system_prompt_dialog()
     st.select_slider(
