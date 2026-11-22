@@ -9,7 +9,7 @@ import json
 import os
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
 from airflow import DAG
@@ -129,6 +129,9 @@ def generate_and_load_fhir():
 default_args = {
     "owner": "airflow",
     "retries": 0,
+    # A hung task (the 2026-11-20 Snowflake push sat "running" for two days and froze the every-5-minute
+    # pipeline) now fails after 30 minutes, so the next scheduled run can start.
+    "execution_timeout": timedelta(minutes=30),
 }
 
 with DAG(

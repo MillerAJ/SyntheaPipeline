@@ -7,7 +7,7 @@ run finished in the 'success' state. It fails closed: no dag_03 run, or a non-su
 aborts the cleanup. (dag_03 raises on any failed table, so success means every table pushed.)
 """
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.models import DagRun
@@ -76,6 +76,9 @@ def delete_processed_and_clean_staging(**context):
 default_args = {
     "owner": "airflow",
     "retries": 0,
+    # A hung task (the 2026-11-20 Snowflake push sat "running" for two days and froze the every-5-minute
+    # pipeline) now fails after 30 minutes, so the next scheduled run can start.
+    "execution_timeout": timedelta(minutes=30),
 }
 
 with DAG(

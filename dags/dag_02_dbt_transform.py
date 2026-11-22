@@ -10,7 +10,7 @@ Lineage metadata is automatically emitted to Marquez via openlineage-dbt (dbt-ol
 Settings come from the pipeline .env with no defaults. Each task checks its own settings first and stops
 before doing anything if one is missing. dbt's profiles.yml reads the STAGING_DB_* settings itself.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -30,6 +30,9 @@ def require(*names):
 default_args = {
     "owner": "airflow",
     "retries": 0,
+    # A hung task (the 2026-11-20 Snowflake push sat "running" for two days and froze the every-5-minute
+    # pipeline) now fails after 30 minutes, so the next scheduled run can start.
+    "execution_timeout": timedelta(minutes=30),
 }
 
 with DAG(

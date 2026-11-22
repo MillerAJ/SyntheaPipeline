@@ -249,6 +249,9 @@ def run_snowflake_push(**context):
 default_args = {
     "owner": "airflow",
     "retries": 0,
+    # A hung task (the 2026-11-20 Snowflake push sat "running" for two days and froze the every-5-minute
+    # pipeline) now fails after 30 minutes, so the next scheduled run can start.
+    "execution_timeout": timedelta(minutes=30),
 }
 
 with DAG(
