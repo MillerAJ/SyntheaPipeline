@@ -7,6 +7,7 @@ import time
 import subprocess
 import hashlib
 import hmac
+import secrets
 import ipaddress
 import threading
 import requests
@@ -173,8 +174,73 @@ st.markdown(
 
 
 
+# ---- Saved chats: a chat's ID lives in the URL (?chat=...); its messages live on this server ----
+# Reloading, a dropped connection or a service restart brings the chat back from that link.
+# Nothing is stored in the browser and there is no list of chats: only someone holding the exact link can open one.
+CHAT_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_store")
+CHAT_STORE_DAYS = 30  # saved chats untouched this long are deleted
+_CHAT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+_chat_prune = {"last": 0.0}
+
+
+def _chat_path(chat_id):
+    return os.path.join(CHAT_STORE_DIR, chat_id + ".json")
+
+
+def _load_chat(chat_id):
+    if not chat_id or not _CHAT_ID_RE.match(chat_id):
+        return None
+    try:
+        with open(_chat_path(chat_id), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_chat():
+    chat_id = st.session_state.get("chat_id")
+    if not chat_id:
+        return
+    try:
+        os.makedirs(CHAT_STORE_DIR, mode=0o700, exist_ok=True)
+        data = {"messages": st.session_state.get("chat_messages", []),
+                "ctx_used": st.session_state.get("ctx_used", 0), "saved": time.time()}
+        tmp = _chat_path(chat_id) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _chat_path(chat_id))
+        if time.time() - _chat_prune["last"] > 3600:  # hourly sweep of expired chats
+            _chat_prune["last"] = time.time()
+            cutoff = time.time() - CHAT_STORE_DAYS * 86400
+            for fn in os.listdir(CHAT_STORE_DIR):
+                p = os.path.join(CHAT_STORE_DIR, fn)
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+    except Exception:
+        pass
+
+
+if "chat_id" not in st.session_state:  # first run of this browser session: restore the chat named in the URL
+    st.session_state.chat_id = None
+    st.session_state.chat_restore_note = None
+    _qp_chat = st.query_params.get("chat")
+    if _qp_chat:
+        _saved = _load_chat(_qp_chat)
+        if _saved:
+            st.session_state.chat_id = _qp_chat
+            st.session_state.chat_messages = _saved.get("messages") or []
+            st.session_state.ctx_used = _saved.get("ctx_used", 0)
+        else:
+            del st.query_params["chat"]
+            st.session_state.chat_restore_note = (
+                f"That chat link wasn't found. Chats unused for {CHAT_STORE_DAYS} days are deleted.")
+    # Open on the AI Chat tab when arriving by a chat link (decided once, so Clear doesn't jump tabs)
+    st.session_state.tab_default = "💬 AI Chat" if st.session_state.chat_id else None
+
 # ---- Tabs (client-side switching; sidebar stays put) ----
-tab_dash, tab_chat, tab_synthea = st.tabs(["📊 Pipeline Dashboard", "💬 AI Chat", "🩺 What is Synthea?"])
+tab_dash, tab_chat, tab_synthea = st.tabs(["📊 Pipeline Dashboard", "💬 AI Chat", "🩺 What is Synthea?"],
+                                          default=st.session_state.get("tab_default"))
 
 with tab_synthea:
     st.title("What is Synthea?")
@@ -253,7 +319,9 @@ def _agent_key():
             return f.read().strip() or None
     except OSError:
         return None
-QWEN_MODEL = "Qwen3.8-27B"
+QWEN_MODEL = "Qwen3.8-Flash-Next"
+# The engine serves the checkpoint from a local path, so /v1/models "root" is not a repo id: link this instead.
+QWEN_CHECKPOINT = "albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE"
 GPU_COUNT, GPU_GB = 2, 24  # dual RTX 3090
 # Claude API list prices, USD per 1M tokens (input, output), from the API reference cached 2026-11-03
 CLOUD_PRICES = {
@@ -267,9 +335,10 @@ CHAT_MAX_HISTORY = 20           # most recent messages sent to the model
 CHAT_MAX_SECONDS = 600          # safety net only (10 min per reply)
 CHAT_ACTIVE_WINDOW = 600        # a visitor counts as "recent" for 10 minutes
 CHAT_SYSTEM_PROMPT = (  # keep in sync with WEBSITE_PROMPT in agent-box /opt/agno/app/service.py
-    "You are a helpful assistant on a website about a synthetic healthcare data pipeline. Your tools: web search "
-    "and page reading, a Python sandbox for analysis and charts, files the user uploads, and read-only SQL on the "
-    "project's Snowflake database (synthetic patients). Use them when they help. Be brief."
+    "You are a helpful assistant on a website about a synthetic healthcare data pipeline. Your tools: a reference "
+    "document about this website and project, web search and page reading, a Python sandbox for analysis and "
+    "charts, files the user uploads, and read-only SQL on the project's Snowflake database (synthetic patients). "
+    "Use them when they help. Be brief."
 )
 
 
@@ -690,6 +759,8 @@ with tab_chat:
         st.title("Chat with a self-hosted AI")
     _ms0 = _model_stats()
     _root = _ms0.get("root") if _ms0 else None
+    if not _root or _root.startswith("/") or _root.count("/") != 1:
+        _root = QWEN_CHECKPOINT
     st.container(key="chatmodel").markdown(
         f"**Model:** [`{QWEN_MODEL}`](https://huggingface.co/Qwen/{QWEN_MODEL})"
         + (f" · [`{_root}`](https://huggingface.co/{_root})" if _root else "")
@@ -700,6 +771,8 @@ with tab_chat:
 
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
+    if st.session_state.get("chat_restore_note"):
+        st.info(st.session_state.pop("chat_restore_note"))
 
     admin = False  # no admin bypass: every visitor shares the same limits
 
@@ -799,6 +872,9 @@ with tab_chat:
         else:
             use_agent = False
             try:
+                if not st.session_state.get("chat_id"):  # first message: give this chat its link
+                    st.session_state.chat_id = secrets.token_urlsafe(24)
+                    st.query_params["chat"] = st.session_state.chat_id
                 names = [f.name for f in attachments]
                 st.session_state.chat_messages.append({"role": "user", "content": prompt, "attachments": names})
                 with chat_box.chat_message("user"):
@@ -816,7 +892,7 @@ with tab_chat:
                 use_agent = not custom_prompt and _agent_key() is not None
                 agent_sid, uploaded, before = None, [], {}
                 if use_agent:
-                    agent_sid = f"web-{cid}-{st.session_state.setdefault('agent_sid', os.urandom(4).hex())}"
+                    agent_sid = f"web-{st.session_state.chat_id}"  # same link = same agent memory, even if your IP changes
                     for f in attachments:
                         try:
                             uploaded.append(_agent_upload(agent_sid, f))
@@ -824,7 +900,8 @@ with tab_chat:
                             st.warning(f"Couldn't upload {f.name}.")
                     before = _agent_list_files(agent_sid)
                     message = prompt + (f"\n\n[Files uploaded to /work: {', '.join(uploaded)}]" if uploaded else "")
-                    stream = _agent_stream(message, agent_sid, cid)
+                    # user_id tied to the chat link too: the agent refuses a session under a different user_id (404)
+                    stream = _agent_stream(message, agent_sid, agent_sid)
                 else:
                     if attachments:
                         st.warning("A custom system prompt chats without tools, so this message was sent without your files.")
@@ -923,6 +1000,7 @@ with tab_chat:
                             {"role": "assistant", "content": answer, "reasoning": reasoning, "steps": steps,
                              "files": new_files, "sid": agent_sid}
                         )
+                        _save_chat()
                     except Exception:
                         st.session_state.chat_messages.pop()  # drop the unanswered user message
                         status.update(label="⚠️ No reply", state="error", expanded=False)
@@ -943,6 +1021,9 @@ with tab_chat:
         st.session_state.ctx_used = 0
         for _k in ("last_stats", "cloud_in", "cloud_out", "agent_sid", "ctx_inc"):  # new agent session = fresh memory
             st.session_state.pop(_k, None)
+        st.session_state.chat_id = None  # next message starts a new chat with a new link (the old link still works)
+        if "chat" in st.query_params:
+            del st.query_params["chat"]
         st.rerun()
 
 with tab_dash:
@@ -961,7 +1042,7 @@ with tab_dash:
         'Synthea generates synthetic healthcare data as JSON files',
         'Raw JSON is loaded into a PostgreSQL database',
         'dbt is used to convert raw JSON into structured tables',
-        'Flattened tables are pushed to Snowflake for long-term storage',
+        'Flattened tables load into Snowflake through Snowpipe, a new batch about every 5 minutes',
     ]
     with st.container(key="pipeheads"):
         for _c, _t in zip(st.columns(4), _step_heads):
@@ -1101,7 +1182,7 @@ with tab_dash:
     else:
         # Active Refresh Button
         if st.sidebar.button(
-            "🔄 Refresh Database Totals",
+            "🔄 Update Database Totals",
             use_container_width=True,
             help="Click to re-run Snowflake queries.",
         ):
@@ -1186,7 +1267,7 @@ with tab_dash:
         </style>
 
         <button class="mb-btn" id="mb-btn" onclick="launchMetabase()">
-            <div class="mb-title" id="mb-title">Explore Databases (Metabase)</div>
+            <div class="mb-title" id="mb-title">Explore Database (Metabase)</div>
             <div class="mb-sub">/metabase-login</div>
         </button>
 
@@ -1285,6 +1366,22 @@ with tab_dash:
 
     # --- PATIENTS ADDED PER HOUR (+ rows overlay) ---
     st.subheader("⏱️ Patients Added Per Hour")
+
+    # How often batches land: fixed schedule text, plus measured numbers from the cache when present.
+    _cad = {}
+    try:
+        with open("snowflake_cache.json") as _f:
+            _cad = json.load(_f).get("cadence") or {}
+    except Exception:
+        pass
+    _cad_txt = ("🔁 The pipeline starts a new batch every 5 minutes, one at a time, so batches run back to back "
+                "and each loads into Snowflake through Snowpipe as soon as it's ready.")
+    if _cad.get("batches_24h", 0) >= 6 and _cad.get("minutes_between_batches"):  # too few batches = noisy average
+        _cad_txt += (f" Last 24 hours: {_cad['batches_24h']:,} batches, about {_cad['patients_per_batch']:,} "
+                     f"patients each, one every ~{_cad['minutes_between_batches']:g} minutes.")
+    elif _cad.get("batches_24h", 1) == 0:
+        _cad_txt += " No batches in the last 24 hours (the pipeline is paused)."
+    st.caption(_cad_txt)
 
     df_hourly = load_hourly(cache_mtime)
     if not df_hourly.empty:

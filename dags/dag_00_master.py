@@ -15,7 +15,9 @@ with DAG(
     dag_id="dag_00_master",
     default_args=default_args,
     description="Orchestrates full Synthea pipeline DAGs 01 through 04 sequentially",
-    schedule_interval="*/5 * * * *",  # every 5 minutes: Snowpipe makes small, frequent loads cheap
+    # Every 5 minutes, one run at a time. A run takes ~3-6 min, so in practice batches go back to back
+    # (~10-12 an hour). Snowpipe bills per GB loaded, so this cadence buys freshness at no extra load cost.
+    schedule_interval="*/5 * * * *",
     catchup=False,
     max_active_runs=1,
 ) as dag:

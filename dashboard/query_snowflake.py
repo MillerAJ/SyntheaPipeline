@@ -1,10 +1,20 @@
 import json
 import os
-import re
 import snowflake.connector
 import toml
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
+
+# Every number on the dashboard comes from LOAD_METRICS: one small row per (pipeline run, table) that the
+# pipeline (dag_03) writes after Snowflake confirms the load, plus hourly backfill rows for older history.
+# Summing it is a scan of a few thousand rows instead of the ~1 billion in the data tables.
+# The same (RUN_TAG, TABLE_NAME) can land twice in a rare retry, so every query dedupes on it first.
+METRICS_CTE = """
+    WITH m AS (
+        SELECT * FROM SYNTHEA_PROD.PUBLIC.LOAD_METRICS
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY RUN_TAG, TABLE_NAME ORDER BY LOADED_AT) = 1
+    )
+"""
 
 
 def fetch_and_cache_metrics():
@@ -44,89 +54,88 @@ def fetch_and_cache_metrics():
     cursor = conn.cursor()
 
     try:
-        # 4. Fetch Total Table Count and Total Row Count directly from metadata
+        # 4. Table count and exact row count from metadata (no table scan). LOAD_METRICS is bookkeeping.
         print("Querying table schema metadata...")
         cursor.execute("""
-            SELECT 
+            SELECT
                 COUNT(*) AS total_tables,
                 COALESCE(SUM(ROW_COUNT), 0) AS total_system_rows
             FROM SYNTHEA_PROD.INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_TYPE = 'BASE TABLE';
+            WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME <> 'LOAD_METRICS';
         """)
-        meta_row = cursor.fetchone()
-        table_count = meta_row[0]
-        total_system_rows = meta_row[1]
+        table_count, total_system_rows = cursor.fetchone()
 
-        # 5. Direct Aggregations for Specific Known Tables
-        print("Querying direct metrics for core entities...")
-        cursor.execute("""
+        # 5. Running totals. Patient-years: living patients count up to today, so LOAD_METRICS stores the
+        # parts (living count, sum of living birth dates as day numbers, finished lifespans in days).
+        print("Querying running totals from LOAD_METRICS...")
+        cursor.execute(METRICS_CTE + """
             SELECT
-                (SELECT COUNT(DISTINCT PATIENT_ID) FROM SYNTHEA_PROD.PUBLIC.PATIENTS) AS unique_patients,
-                (SELECT COUNT(DISTINCT CLAIM_ID) FROM SYNTHEA_PROD.PUBLIC.CLAIMS) AS unique_claims,
-                (SELECT COUNT(DISTINCT ENCOUNTER_ID) FROM SYNTHEA_PROD.PUBLIC.ENCOUNTERS) AS total_encounters,
-                (SELECT COUNT(DISTINCT PROCEDURE_ID) FROM SYNTHEA_PROD.PUBLIC.PROCEDURES) AS total_procedures,
-                (SELECT COUNT(DISTINCT CODE) FROM SYNTHEA_PROD.PUBLIC.MEDICATIONS) AS unique_medications,
-                (SELECT COUNT(DISTINCT PATIENT_ID) FROM SYNTHEA_PROD.PUBLIC.PATIENTS WHERE INSERTED_AT IS NULL) AS patients_undated;
+                SUM(IFF(TABLE_NAME = 'PATIENTS', RECORD_COUNT, 0)),
+                SUM(IFF(TABLE_NAME = 'CLAIMS', RECORD_COUNT, 0)),
+                SUM(IFF(TABLE_NAME IN ('ENCOUNTERS', 'PROCEDURES'), RECORD_COUNT, 0)),
+                SUM(IFF(TABLE_NAME = 'CLAIMS', AMOUNT_SUM, 0)),
+                SUM(IFF(TABLE_NAME = 'EXPLANATION_OF_BENEFITS', AMOUNT_SUM, 0)),
+                ( SUM(IFF(TABLE_NAME = 'PATIENTS', LIVING_PATIENTS, 0)) * DATEDIFF('day', '1970-01-01'::DATE, CURRENT_DATE)
+                  - SUM(IFF(TABLE_NAME = 'PATIENTS', LIVING_BIRTH_DAYS_SUM, 0))
+                  + SUM(IFF(TABLE_NAME = 'PATIENTS', DECEASED_LIFESPAN_DAYS_SUM, 0)) ) / 365.25
+            FROM m;
         """)
-        metrics_row = cursor.fetchone()
+        patients, claims, enc_proc, charges, payments, patient_years = cursor.fetchone()
 
-        # 6. Daily Trend: patients added to the database per day (UTC).
-        # INSERTED_AT is the epoch time the patient's bundle was loaded into the pipeline.
-        # Older patients without a load timestamp are counted separately (patients_undated).
+        # 6. Daily trend: patients added per day (UTC).
         print("Querying patients-added daily trend...")
-        cursor.execute("""
-            SELECT
-                TO_VARCHAR(TO_TIMESTAMP_NTZ(INSERTED_AT)::DATE, 'YYYY-MM-DD') AS added_date,
-                COUNT(DISTINCT PATIENT_ID) AS patient_count
-            FROM SYNTHEA_PROD.PUBLIC.PATIENTS
-            WHERE INSERTED_AT IS NOT NULL
-            GROUP BY 1
-            ORDER BY 1 ASC;
+        cursor.execute(METRICS_CTE + """
+            SELECT TO_VARCHAR(CONVERT_TIMEZONE('UTC', LOADED_AT)::DATE, 'YYYY-MM-DD') AS added_date,
+                   SUM(RECORD_COUNT) AS patient_count
+            FROM m WHERE TABLE_NAME = 'PATIENTS'
+            GROUP BY 1 ORDER BY 1;
         """)
         trend_rows = cursor.fetchall()
 
-        # 6b. Hourly trend (UTC, last 14 days): patients added and rows added across every
-        # PUBLIC table that carries INSERTED_AT. Legacy rows (NULL INSERTED_AT) are excluded.
+        # 6b. Hourly trend (UTC, last 14 days): patients added and rows added across every table.
         print("Querying hourly patients/rows trend...")
-        cursor.execute("""
-            SELECT TABLE_NAME
-            FROM SYNTHEA_PROD.INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = 'PUBLIC' AND COLUMN_NAME = 'INSERTED_AT'
-            ORDER BY TABLE_NAME;
-        """)
-        ins_tables = [r[0] for r in cursor.fetchall() if re.fullmatch(r"[A-Z0-9_]+", r[0])]
-        window = "INSERTED_AT >= DATE_PART(epoch_second, DATEADD(day, -14, CURRENT_TIMESTAMP()))"
-        hour_expr = "TO_VARCHAR(DATE_TRUNC('hour', TO_TIMESTAMP_NTZ(INSERTED_AT)), 'YYYY-MM-DD HH24:MI:SS')"
-        union_sql = " UNION ALL ".join(
-            f"SELECT {hour_expr} AS h, COUNT(*) AS n FROM SYNTHEA_PROD.PUBLIC.{t} WHERE {window} GROUP BY 1"
-            for t in ins_tables
-        )
-        cursor.execute(f"SELECT h, SUM(n) FROM ({union_sql}) GROUP BY 1 ORDER BY 1;")
-        rows_by_hour = {r[0]: int(r[1]) for r in cursor.fetchall()}
-        cursor.execute(f"""
-            SELECT {hour_expr} AS h, COUNT(DISTINCT PATIENT_ID)
-            FROM SYNTHEA_PROD.PUBLIC.PATIENTS
-            WHERE {window}
+        cursor.execute(METRICS_CTE + """
+            SELECT TO_VARCHAR(DATE_TRUNC('hour', CONVERT_TIMEZONE('UTC', LOADED_AT)::TIMESTAMP_NTZ),
+                              'YYYY-MM-DD HH24:MI:SS') AS h,
+                   SUM(IFF(TABLE_NAME = 'PATIENTS', RECORD_COUNT, 0)),
+                   SUM(ROW_COUNT)
+            FROM m WHERE LOADED_AT >= DATEADD(day, -14, CURRENT_TIMESTAMP())
             GROUP BY 1 ORDER BY 1;
         """)
-        patients_by_hour = {r[0]: int(r[1]) for r in cursor.fetchall()}
-        hourly = [
-            {"hour": h, "patients": patients_by_hour.get(h, 0), "rows": rows_by_hour.get(h, 0)}
-            for h in sorted(set(rows_by_hour) | set(patients_by_hour))
-        ]
+        hourly = [{"hour": h, "patients": int(p or 0), "rows": int(r or 0)} for h, p, r in cursor.fetchall()]
+
+        # 6c. Batch cadence over the last 24 hours (real pipeline runs only, not the hourly backfill rows).
+        print("Querying batch cadence...")
+        cursor.execute(METRICS_CTE + """
+            SELECT COUNT(DISTINCT RUN_TAG),
+                   SUM(IFF(TABLE_NAME = 'PATIENTS', RECORD_COUNT, 0)),
+                   DATEDIFF('second', MIN(LOADED_AT), MAX(LOADED_AT)),
+                   TO_VARCHAR(CONVERT_TIMEZONE('UTC', MAX(LOADED_AT)), 'YYYY-MM-DD HH24:MI:SS')
+            FROM m
+            WHERE RUN_TAG NOT LIKE 'backfill%' AND LOADED_AT >= DATEADD(hour, -24, CURRENT_TIMESTAMP());
+        """)
+        runs, run_patients, span_s, last_load = cursor.fetchone()
+        cadence = {
+            "batches_24h": int(runs or 0),
+            "patients_per_batch": round(run_patients / runs) if runs else None,
+            "minutes_between_batches": round(span_s / 60 / (runs - 1), 1) if runs and runs > 1 else None,
+            "last_batch_utc": last_load,
+        }
 
         # 7. Package Payload
         payload = {
             "metrics": {
                 "total_tables": table_count,
-                "unique_patients": metrics_row[0],
-                "unique_claims": metrics_row[1],
-                "encounters_plus_procedures": metrics_row[2]+metrics_row[3],
-                "unique_medications": metrics_row[4],
+                "unique_patients": int(patients or 0),
+                "unique_claims": int(claims or 0),
+                "encounters_plus_procedures": int(enc_proc or 0),
                 "total_rows": total_system_rows,
-                "patients_undated": metrics_row[5],
+                "total_charges": float(charges or 0),
+                "total_payments": float(payments or 0),
+                "patient_years": float(patient_years or 0),
             },
-            "trend": [{"date": row[0], "count": row[1]} for row in trend_rows],
+            "cadence": cadence,
+            "trend": [{"date": row[0], "count": int(row[1])} for row in trend_rows],
             "trend_hourly": hourly,
         }
 
