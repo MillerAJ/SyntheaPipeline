@@ -6,7 +6,9 @@ x-airflow-common:
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-metadata-db/airflow
+    # Secrets come from .env with no defaults: compose refuses to start until they are set (see .env.example).
+    # AIRFLOW_DB_PASSWORD sits inside a URL here, so use letters, digits, '-' or '_' only.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?Set AIRFLOW_DB_PASSWORD in .env}@airflow-metadata-db/airflow
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
     # OpenLineage -> Marquez integration. This is what makes Airflow
@@ -44,7 +46,7 @@ services:
     image: postgres:15
     environment:
       POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?Set AIRFLOW_DB_PASSWORD in .env}
       POSTGRES_DB: airflow
     volumes:
       - airflow-metadata-db-volume:/var/lib/postgresql/data
@@ -66,7 +68,7 @@ services:
           --lastname admin \
           --role Admin \
           --email admin@example.com \
-          --password admin
+          --password "${AIRFLOW_ADMIN_PASSWORD:?Set AIRFLOW_ADMIN_PASSWORD in .env}"
 
   airflow-webserver:
     <<: *airflow-common
@@ -88,7 +90,7 @@ services:
     image: postgres:15
     environment:
       POSTGRES_USER: marquez
-      POSTGRES_PASSWORD: marquez
+      POSTGRES_PASSWORD: ${MARQUEZ_DB_PASSWORD:?Set MARQUEZ_DB_PASSWORD in .env}
       POSTGRES_DB: marquez
     volumes:
       - marquez-db-volume:/var/lib/postgresql/data
@@ -102,6 +104,8 @@ services:
     environment:
       MARQUEZ_PORT: 5000
       MARQUEZ_ADMIN_PORT: 5001
+      # marquez.yml reads its database password from this variable.
+      MARQUEZ_DB_PASSWORD: ${MARQUEZ_DB_PASSWORD:?Set MARQUEZ_DB_PASSWORD in .env}
     ports:
       - "5000:5000"
       - "5001:5001"

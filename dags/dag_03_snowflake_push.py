@@ -24,48 +24,53 @@ import requests
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
-from dotenv import load_dotenv
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-load_dotenv()
+from pipeline_env import require_env, staging_db_config
 
 CHUNK_SIZE = 250_000          # rows per Parquet file
 LOAD_TIMEOUT_S = 600          # max wait for Snowpipe to report every file
 POLL_EVERY_S = 10
 
-SF_TARGET_DATABASE = os.getenv("SNOWFLAKE_TARGET_DB", "SYNTHEA_PROD")
-SF_TARGET_SCHEMA = os.getenv("SNOWFLAKE_TARGET_SCHEMA", "PUBLIC")
-STAGE = f"{SF_TARGET_DATABASE}.{SF_TARGET_SCHEMA}.SNOWPIPE_STAGE"
 
-DB_CONFIG = {
-    "dbname": os.getenv("POSTGRES_DB", "staging_db"),
-    "user": os.getenv("POSTGRES_USER", "postgres"),
-    "password": os.getenv("POSTGRES_PASSWORD"),
-    "host": os.getenv("POSTGRES_HOST", "host.docker.internal"),
-    "port": os.getenv("POSTGRES_PORT", "5432"),
-}
-
-KEY_FILE_PATH = os.path.expanduser(os.getenv("SNOWFLAKE_DOCKER_PRIVATE_KEY_PATH", "~/.snowflake/rsa_key.p8"))
+# --------------------------------------------------------------------------- settings
+def snowflake_settings():
+    """Every Snowflake setting comes from the pipeline .env (no defaults), read when the task runs."""
+    database, schema, key_path, account, user, role = require_env(
+        "SNOWFLAKE_TARGET_DB", "SNOWFLAKE_TARGET_SCHEMA", "SNOWFLAKE_DOCKER_PRIVATE_KEY_PATH",
+        "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_ROLE",
+    )
+    return {
+        "database": database,
+        "schema": schema,
+        "stage": f"{database}.{schema}.SNOWPIPE_STAGE",
+        "key_path": os.path.expanduser(key_path),
+        "account": account,
+        "user": user,
+        "role": role,
+        # Optional override; otherwise derived from the account identifier.
+        "host": os.environ.get("SNOWFLAKE_HOST") or f"{account.lower()}.snowflakecomputing.com",
+    }
 
 
 # --------------------------------------------------------------------------- auth
-def load_private_key_obj():
-    if not os.path.exists(KEY_FILE_PATH):
-        raise RuntimeError("Snowpipe REST needs key-pair auth, but the private key file was not found.")
-    with open(KEY_FILE_PATH, "rb") as key_file:
+def load_private_key_obj(key_path):
+    if not os.path.exists(key_path):
+        raise RuntimeError(f"Snowpipe REST needs key-pair auth, but the private key file was not found at {key_path}.")
+    with open(key_path, "rb") as key_file:
         return serialization.load_pem_private_key(key_file.read(), password=None, backend=default_backend())
 
 
-def get_snowflake_config(key_obj):
+def get_snowflake_config(sf, key_obj):
+    # No warehouse: PUT and REMOVE need none, and Snowpipe loads are serverless.
     return {
-        "user": os.getenv("SNOWFLAKE_USER"),
-        "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-        "role": os.getenv("SNOWFLAKE_ROLE"),
-        "warehouse": os.getenv("SNOWFLAKE_WH"),  # set but never used: PUT/REMOVE need no warehouse
-        "database": SF_TARGET_DATABASE,
-        "schema": SF_TARGET_SCHEMA,
+        "user": sf["user"],
+        "account": sf["account"],
+        "role": sf["role"],
+        "database": sf["database"],
+        "schema": sf["schema"],
         "private_key": key_obj.private_bytes(
             encoding=serialization.Encoding.DER,
             format=serialization.PrivateFormat.PKCS8,
@@ -77,11 +82,10 @@ def get_snowflake_config(key_obj):
 class SnowpipeClient:
     """Minimal Snowpipe REST client (insertFiles / insertReport) using a key-pair JWT."""
 
-    def __init__(self, key_obj):
-        account = os.getenv("SNOWFLAKE_ACCOUNT")
-        self.host = os.getenv("SNOWFLAKE_HOST") or f"{account.lower()}.snowflakecomputing.com"
-        self.account = account.split(".")[0].upper()
-        self.user = os.getenv("SNOWFLAKE_USER").upper()
+    def __init__(self, sf, key_obj):
+        self.host = sf["host"]
+        self.account = sf["account"].split(".")[0].upper()
+        self.user = sf["user"].upper()
         self.key = key_obj
         pub = key_obj.public_key().public_bytes(
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
@@ -123,7 +127,7 @@ class SnowpipeClient:
 
 
 # --------------------------------------------------------------------------- push
-def stage_table(pg_conn, sf_cur, table_name, run_tag, tmpdir):
+def stage_table(pg_conn, sf_cur, stage, table_name, run_tag, tmpdir):
     """Write one flat table to Parquet files in the stage. Returns ({file: rows}, total_rows)."""
     folder = table_name.lower()
     files, total = {}, 0
@@ -141,7 +145,7 @@ def stage_table(pg_conn, sf_cur, table_name, run_tag, tmpdir):
         fname = f"{run_tag}_{folder}_{i:04d}.parquet"
         local = os.path.join(tmpdir, fname)
         chunk_df.to_parquet(local, index=False)
-        sf_cur.execute(f"PUT 'file://{local}' @{STAGE}/{folder}/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE")
+        sf_cur.execute(f"PUT 'file://{local}' @{stage}/{folder}/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE")
         status = sf_cur.fetchone()[6]
         os.remove(local)
         if status not in ("UPLOADED", "SKIPPED"):
@@ -179,11 +183,14 @@ def wait_for_loads(client, pending):
 
 
 def run_snowflake_push(**context):
+    # Settings first: a missing one stops the task here, before anything is read or uploaded.
+    sf = snowflake_settings()
+    db_config = staging_db_config()
     run_tag = re.sub(r"[^0-9A-Za-z]+", "", context["run_id"])[-20:] + "_" + uuid.uuid4().hex[:6]
-    key_obj = load_private_key_obj()
-    client = SnowpipeClient(key_obj)
+    key_obj = load_private_key_obj(sf["key_path"])
+    client = SnowpipeClient(sf, key_obj)
 
-    pg_conn = psycopg2.connect(**DB_CONFIG)
+    pg_conn = psycopg2.connect(**db_config)
     cursor = pg_conn.cursor()
     cursor.execute("""
         SELECT tablename FROM pg_tables
@@ -198,17 +205,17 @@ def run_snowflake_push(**context):
         # Fail closed: an empty flat schema means dbt produced nothing.
         raise RuntimeError("No tables found in flat schema to push. Failing so nothing downstream runs.")
 
-    sf_conn = snowflake.connector.connect(**get_snowflake_config(key_obj))
+    sf_conn = snowflake.connector.connect(**get_snowflake_config(sf, key_obj))
     sf_cur = sf_conn.cursor()
     pending, totals, failed = {}, {}, []
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             for t in tables:
                 try:
-                    files, total = stage_table(pg_conn, sf_cur, t, run_tag, tmpdir)
+                    files, total = stage_table(pg_conn, sf_cur, sf["stage"], t, run_tag, tmpdir)
                     totals[t] = total
                     if files:
-                        pipe = f"{SF_TARGET_DATABASE}.{SF_TARGET_SCHEMA}.{t.upper()}_PIPE"
+                        pipe = f"{sf['database']}.{sf['schema']}.{t.upper()}_PIPE"
                         client.insert_files(pipe, list(files))
                         pending[pipe] = files
                     print(f"Staged flat.{t}: {total} rows in {len(files)} file(s)")
@@ -223,14 +230,14 @@ def run_snowflake_push(**context):
         # Remove this run's files from the stage once Snowpipe has them (load history keeps dedupe).
         for pipe in submitted:
             folder = pipe.split(".")[-1][: -len("_PIPE")].lower()
-            sf_cur.execute(f"REMOVE @{STAGE}/{folder}/ PATTERN = '.*{run_tag}.*'")
+            sf_cur.execute(f"REMOVE @{sf['stage']}/{folder}/ PATTERN = '.*{run_tag}.*'")
     finally:
         sf_cur.close()
         sf_conn.close()
         pg_conn.close()
 
     print(f"Snowpipe load summary: {sum(totals.values())} rows across {len(totals)} tables -> "
-          f"{SF_TARGET_DATABASE}.{SF_TARGET_SCHEMA}")
+          f"{sf['database']}.{sf['schema']}")
     for t in sorted(totals):
         print(f"    {t}: {totals[t]}")
 

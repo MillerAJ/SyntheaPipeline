@@ -3,10 +3,11 @@ synthea_pipeline:
   outputs:
     dev:
       type: postgres
-      host: host.docker.internal
-      user: postgres
-      password: "{{ env_var('POSTGRES_PASSWORD') }}"
-      port: 5432
-      dbname: staging_db
+      # Every value comes from the pipeline .env (no defaults): dbt stops with an error if one is missing.
+      host: "{{ env_var('STAGING_DB_HOST') }}"
+      user: "{{ env_var('STAGING_DB_USER') }}"
+      password: "{{ env_var('STAGING_DB_PASSWORD') }}"
+      port: "{{ env_var('STAGING_DB_PORT') | as_number }}"
+      dbname: "{{ env_var('STAGING_DB_NAME') }}"
       schema: public
       threads: 4

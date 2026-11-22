@@ -6,7 +6,6 @@ Before issuing any TRUNCATE, this DAG checks that the most recent dag_03_snowfla
 run finished in the 'success' state. It fails closed: no dag_03 run, or a non-success run,
 aborts the cleanup. (dag_03 raises on any failed table, so success means every table pushed.)
 """
-import os
 import psycopg2
 from datetime import datetime
 
@@ -15,16 +14,13 @@ from airflow.models import DagRun
 from airflow.operators.python import PythonOperator
 from airflow.utils.state import DagRunState
 
-DB_CONFIG = {
-    "dbname": os.getenv("POSTGRES_DB", "staging_db"),
-    "user": os.getenv("POSTGRES_USER", "postgres"),
-    "password": os.getenv("POSTGRES_PASSWORD"),
-    "host": os.getenv("POSTGRES_HOST", "host.docker.internal"),
-    "port": os.getenv("POSTGRES_PORT", "5432"),
-}
+from pipeline_env import staging_db_config
 
 
 def delete_processed_and_clean_staging(**context):
+    # Settings first (pipeline .env, no defaults): a missing one stops the task before anything else.
+    db_config = staging_db_config()
+
     # Guard: the latest dag_03 run must exist and have succeeded (fail closed).
     # An XCom pull across DAG runs does not work (XComs are scoped to a run), so
     # check the run state directly.
@@ -38,7 +34,7 @@ def delete_processed_and_clean_staging(**context):
         )
 
     failures = []
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(**db_config)
     cursor = conn.cursor()
 
     # 1. Clean up raw FHIR bundles landing table

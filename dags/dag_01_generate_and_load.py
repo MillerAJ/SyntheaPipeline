@@ -14,30 +14,20 @@ from urllib.parse import quote_plus
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
-load_dotenv()
-
-DB_USER = os.getenv("POSTGRES_USER", "airflow")
-DB_PASSWORD = os.getenv("STAGING_DB_PASSWORD")  # set in .env; checked at task runtime
-DB_HOST = os.getenv("POSTGRES_HOST", "airflow-metadata-db")
-DB_PORT = os.getenv("POSTGRES_PORT", "5432")
-DB_NAME = os.getenv("POSTGRES_DB", "staging_db")
-
-
-# Directories & Execution Params
-SYNTHEA_DIR = os.getenv("SYNTHEA_DIR", "/opt/airflow/synthea")
-OUTPUT_DIR = os.path.join(SYNTHEA_DIR, "fhir")
-NUM_PATIENTS = int(os.getenv("SYNTHEA_PATIENTS", "100"))
+from pipeline_env import require_env, staging_db_config
 
 
 def generate_and_load_fhir():
-    if not DB_PASSWORD:
-        raise RuntimeError("STAGING_DB_PASSWORD is not set. Add it to the pipeline .env and recreate the Airflow containers.")
+    # Every setting comes from the pipeline .env (no defaults); a missing one stops here, before any work.
+    db = staging_db_config()
+    synthea_dir, num_patients = require_env("SYNTHEA_DIR", "SYNTHEA_PATIENTS")
+    num_patients = int(num_patients)
+    output_dir = os.path.join(synthea_dir, "fhir")
+
     engine = create_engine(
-        f"postgresql://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        f"postgresql://{quote_plus(db['user'])}:{quote_plus(db['password'])}@{db['host']}:{db['port']}/{db['dbname']}"
     )
 
     # 1. Ensure landing schema and target JSONB table exist with an explicit unique constraint
@@ -65,26 +55,26 @@ def generate_and_load_fhir():
         raise RuntimeError(f"Insufficient disk space ({free_gb:.2f} GB available). Aborting run.")
 
     # 3. Ensure output directory exists and clean up stale FHIR output files if present
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    if os.path.exists(OUTPUT_DIR):
-        for f in glob.glob(f"{OUTPUT_DIR}/*.json"):
+    os.makedirs(output_dir, exist_ok=True)
+    if os.path.exists(output_dir):
+        for f in glob.glob(f"{output_dir}/*.json"):
             os.remove(f)
 
     # 4. Execute Synthea Java CLI
-    synthea_jar = glob.glob(f"{SYNTHEA_DIR}/synthea-with-dependencies*.jar")
+    synthea_jar = glob.glob(f"{synthea_dir}/synthea-with-dependencies*.jar")
     if not synthea_jar:
-        raise FileNotFoundError(f"Could not locate Synthea JAR in {SYNTHEA_DIR}")
+        raise FileNotFoundError(f"Could not locate Synthea JAR in {synthea_dir}")
 
     cmd = [
         "java",
         "-jar",
         synthea_jar[0],
         "-p",
-        str(NUM_PATIENTS),
+        str(num_patients),
         "--exporter.fhir.export=true",
         "--exporter.hospital.fhir.export=false",
         "--exporter.practitioner.fhir.export=false",
-        f"--exporter.baseDirectory={SYNTHEA_DIR}",
+        f"--exporter.baseDirectory={synthea_dir}",
         "New York",
     ]
 
@@ -92,11 +82,11 @@ def generate_and_load_fhir():
     subprocess.run(cmd, check=True)
 
     # 5. Ingest JSON bundles into Postgres raw.fhir_bundles
-    json_files = glob.glob(os.path.join(OUTPUT_DIR, "*.json"))
+    json_files = glob.glob(os.path.join(output_dir, "*.json"))
     print(f"Discovered {len(json_files)} FHIR JSON bundles to ingest.")
 
     if not json_files:
-        raise ValueError(f"No JSON bundle files found in directory: {OUTPUT_DIR}. Aborting run.")
+        raise ValueError(f"No JSON bundle files found in directory: {output_dir}. Aborting run.")
 
 
     records = []

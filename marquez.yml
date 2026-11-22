@@ -2,4 +2,5 @@ db:
   driverClass: org.postgresql.Driver
   url: jdbc:postgresql://marquez-db:5432/marquez
   user: marquez
-  password: marquez
+  # From the pipeline .env via docker-compose (marquez service environment); no default.
+  password: ${MARQUEZ_DB_PASSWORD}
