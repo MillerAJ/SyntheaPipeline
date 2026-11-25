@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import re
 import os
 import sys
@@ -1374,14 +1375,7 @@ with tab_dash:
             _cad = json.load(_f).get("cadence") or {}
     except Exception:
         pass
-    _cad_txt = ("🔁 The pipeline starts a new batch every 5 minutes, one at a time, so batches run back to back "
-                "and each loads into Snowflake through Snowpipe as soon as it's ready.")
-    if _cad.get("batches_24h", 0) >= 6 and _cad.get("minutes_between_batches"):  # too few batches = noisy average
-        _cad_txt += (f" Last 24 hours: {_cad['batches_24h']:,} batches, about {_cad['patients_per_batch']:,} "
-                     f"patients each, one every ~{_cad['minutes_between_batches']:g} minutes.")
-    elif _cad.get("batches_24h", 1) == 0:
-        _cad_txt += " No batches in the last 24 hours (the pipeline is paused)."
-    st.caption(_cad_txt)
+
 
     df_hourly = load_hourly(cache_mtime)
     if not df_hourly.empty:
@@ -1427,8 +1421,18 @@ with tab_dash:
                     axis=alt.Axis(titleColor="#2563eb", labelExpr=COMPACT_LABEL, orient="left", grid=False)),
             tooltip=tooltip,
         )
+        # Note over the Nov 20-22 gap: loads paused while the model server was upgraded
+        def _et(ts):
+            return pd.Timestamp(ts, tz="UTC").tz_convert("America/New_York").tz_localize(None)
+        _gap = pd.DataFrame({
+            "start": [_et("2026-11-20 09:00")], "end": [_et("2026-11-22 13:00")],
+            "mid": [_et("2026-11-21 11:00")],
+        })
+        gap_text = alt.Chart(_gap).mark_text(
+            color="#64748b", fontSize=12, fontStyle="italic", lineBreak="|", baseline="middle",
+        ).encode(x="mid:T", y=alt.value(170), text=alt.value("Paused to upgrade|to Qwen3.8-Flash-Next"))
         st.altair_chart(
-            bars.properties(height=320),
+            alt.layer(bars, gap_text).properties(height=320),
             width="stretch",
         )
     elif not df_trend.empty:
@@ -1439,6 +1443,221 @@ with tab_dash:
         st.bar_chart(df_trend, y="count", height=300)
     else:
         st.info("No patient trend data available.")
+
+    # --- PATIENT DEMOGRAPHICS ---
+    # Built from the pre-aggregated "demographics" cube in snowflake_cache.json (query_snowflake.py step 6d).
+    # Filters live in a fragment, so changing one redraws only this section, not the whole page.
+    st.divider()
+    st.subheader("👥 Patient Demographics")
+
+    @st.cache_data(ttl=60)
+    def load_demographics(cache_mtime):
+        try:
+            with open("snowflake_cache.json") as f:
+                d = json.load(f).get("demographics") or {}
+        except Exception:
+            d = {}
+        if not d.get("cube"):
+            return pd.DataFrame(), pd.DataFrame()
+        return (pd.DataFrame(d["cube"], columns=d["cube_cols"]),
+                pd.DataFrame(d.get("cities", []), columns=d.get("city_cols")))
+
+    DEMO_BLUE, DEMO_ORANGE, DEMO_MUTED = "#2a78d6", "#eb6834", "#898781"
+    US_TOPO = "https://cdn.jsdelivr.net/npm/vega-datasets@v1.29.0/data/us-10m.json"
+
+    @st.cache_data
+    def _ny_geo():
+        with open("ny_geo.json") as f:
+            return json.load(f)
+
+    def _band_label(b):
+        return "90+" if b >= 90 else f"{b}–{b + 4}"
+
+    def _demo_bar_list(df, col, total, height_per=30):
+        """Horizontal share-of-patients bars, largest first, hover highlights one bar."""
+        d = df.groupby(col, as_index=False)["n"].sum().sort_values("n", ascending=False)
+        d["share"] = d["n"] / total
+        hover = alt.selection_point(on="pointerover", clear="pointerout", fields=[col])
+        base = alt.Chart(d).encode(
+            y=alt.Y(f"{col}:N", sort="-x", title=None,
+                    axis=alt.Axis(ticks=False, domain=False, labelLimit=190, labelPadding=8)),
+            x=alt.X("n:Q", title=None, axis=None, scale=alt.Scale(domain=[0, float(d["n"].max()) * 1.35])),
+        )
+        bars = base.mark_bar(color=DEMO_BLUE, cornerRadiusEnd=4).encode(
+            opacity=alt.condition(hover, alt.value(1), alt.value(0.4)),
+            tooltip=[alt.Tooltip(f"{col}:N", title=col.capitalize()),
+                     alt.Tooltip("n:Q", title="Patients", format=","),
+                     alt.Tooltip("share:Q", title="Share", format=".1%")],
+        ).add_params(hover)
+        labels = base.mark_text(align="left", dx=6, fontSize=12, color=DEMO_MUTED).encode(
+            text=alt.Text("share:Q", format=".1%"))
+        return (bars + labels).properties(height=max(height_per * len(d), 80))
+
+    @st.fragment
+    def demographics_section(cube, cities):
+        f1, f2, f3, f4 = st.columns([1.15, 1, 1.25, 2.2])
+        status = f1.segmented_control("Status", ["All", "Living", "Deceased"], default="All", key="demo_status") or "All"
+        gender = f2.segmented_control("Gender", ["All", "Female", "Male"], default="All", key="demo_gender") or "All"
+        eth = f3.selectbox("Ethnicity", ["All"] + sorted(cube["ethnicity"].unique()), key="demo_eth")
+        races = f4.multiselect("Race", sorted(cube["race"].unique()), key="demo_race", placeholder="All races")
+
+        df = cube
+        if status != "All":
+            df = df[df["deceased"] == (status == "Deceased")]
+        if gender != "All":
+            df = df[df["gender"] == gender]
+        if eth != "All":
+            df = df[df["ethnicity"] == eth]
+        if races:
+            df = df[df["race"].isin(races)]
+        total = int(df["n"].sum())
+        if total == 0:
+            st.info("No patients match these filters.")
+            return
+
+        # Headline tiles
+        by_band = df.groupby("age_band")["n"].sum().sort_index()
+        median_band = int(by_band.index[(by_band.cumsum() >= total / 2).argmax()])
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Patients Shown", f"{total:,}", help="Patients matching the filters above.")
+        t2.metric("Median Age Band", _band_label(median_band),
+                  help="Age today for living patients, age at death for deceased ones.")
+        _m = int(df.loc[df["gender"] == "Male", "n"].sum())
+        _f = int(df.loc[df["gender"] == "Female", "n"].sum())
+        t3.metric("Female : Male", f"{_f / _m:.2f} : 1" if _f and _m else ("Female only" if _f else "Male only"),
+                  help=f"{_f:,} female and {_m:,} male patients shown, as females per male.")
+        t4.metric("Hispanic or Latino", f"{df.loc[df['ethnicity'] == 'Hispanic or Latino', 'n'].sum() / total:.1%}")
+
+        left, right = st.columns([1.15, 1], gap="large")
+
+        # Age pyramid: female to the left, male to the right
+        with left:
+            st.markdown("##### Age & Gender")
+            pyr = df[df["gender"].isin(["Female", "Male"])].groupby(["age_band", "gender"], as_index=False)["n"].sum()
+            pyr["band"] = pyr["age_band"].map(_band_label)
+            pyr["signed"] = pyr["n"].where(pyr["gender"] == "Male", -pyr["n"])
+            pyr["share"] = pyr["n"] / total
+            order = [_band_label(b) for b in range(90, -1, -5)]
+            hover = alt.selection_point(on="pointerover", clear="pointerout", fields=["band"])
+            reach = float(pyr["n"].max()) * 1.05 if not pyr.empty else 1.0
+            base = alt.Chart(pyr).encode(
+                y=alt.Y("band:N", sort=order, title=None, scale=alt.Scale(paddingInner=0.18),
+                        axis=alt.Axis(ticks=False, domain=False, labelPadding=8)),
+                x=alt.X("signed:Q", title="Patients", scale=alt.Scale(domain=[-reach, reach]),
+                        axis=alt.Axis(grid=True, gridOpacity=0.4, tickCount=6,
+                                      labelExpr="abs(datum.value) >= 1000 ? format(abs(datum.value) / 1000, '~f') + 'k'"
+                                                " : format(abs(datum.value), '~f')")),
+                color=alt.Color("gender:N", title=None,
+                                scale=alt.Scale(domain=["Female", "Male"], range=[DEMO_ORANGE, DEMO_BLUE]),
+                                legend=alt.Legend(orient="top", direction="horizontal", symbolType="square")),
+                opacity=alt.condition(hover, alt.value(1), alt.value(0.4)),
+                tooltip=[alt.Tooltip("band:N", title="Age"), alt.Tooltip("gender:N", title="Gender"),
+                         alt.Tooltip("n:Q", title="Patients", format=","),
+                         alt.Tooltip("share:Q", title="Share of shown", format=".1%")],
+            )
+            fem = base.transform_filter("datum.gender == 'Female'").mark_bar(cornerRadiusTopLeft=4, cornerRadiusBottomLeft=4)
+            mal = base.transform_filter("datum.gender == 'Male'").mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+            st.altair_chart(alt.layer(fem, mal).add_params(hover).properties(height=470), width="stretch")
+            st.caption("Age today for living patients, age at death for deceased ones.")
+
+        # Map: one bubble per city, area proportional to patients (Status filter applies)
+        with right:
+            st.markdown("##### Where Patients Live")
+            cv = cities.copy()
+            if status == "Living":
+                cv["n"] = cv["n"] - cv["deceased"]
+            elif status == "Deceased":
+                cv["n"] = cv["deceased"]
+            cv = cv[cv["n"] > 0].sort_values("n", ascending=False)  # big bubbles first, small ones on top
+            # deck.gl map: drag to pan, scroll / pinch / double-click to zoom down to street level.
+            # Bubble radius is in metres (area ~ patients), so nearby towns separate as you zoom in.
+            import pydeck as pdk
+            # Radius ~ patients^0.35 (gentler than area-true sqrt): cities range 1..119K patients, so sqrt left ~99%
+            # of them at the pixel floor. At the opening zoom (~1.7 km/px): ~1 px for 1 patient, ~3 px median,
+            # ~9 px for the top 1%, NYC capped at 35 px.
+            # Radius in SCREEN PIXELS (not metres): sizes stay proportional at every zoom. Metres + a pixel cap made
+            # big cities hit the cap when zoomed in, so Rochester (3K) looked the same as Pittsford (22).
+            cv["radius"] = cv["n"] ** 0.33 * 0.998  # +10% three times (user, 2026-11-25); NYC ~47 px
+            cv["patients"] = cv["n"].map("{:,}".format)
+            dots = pdk.Layer(
+                "ScatterplotLayer", data=cv[["city", "lat", "lon", "radius", "patients"]],
+                get_position="[lon, lat]", get_radius="radius", radius_units="'pixels'", radius_min_pixels=0.75,
+                get_fill_color=[42, 120, 214, 115], stroked=False,
+                pickable=True, auto_highlight=True, highlight_color=[235, 104, 52, 200],
+            )
+            # New York only, drawn like the old static map: faint blue fill, grey outline, thin county lines
+            _geo = _ny_geo()
+            ny_state = pdk.Layer("GeoJsonLayer", data=_geo["state"], filled=True, stroked=True,
+                                 get_fill_color=[42, 120, 214, 13], get_line_color=[137, 135, 129, 255],
+                                 get_line_width=100, line_width_min_pixels=1, line_width_max_pixels=1)
+            try:
+                _dark = st.context.theme.type == "dark"
+            except Exception:
+                _dark = False
+            # Street basemap, but only New York shows: a page-coloured polygon covers everything outside the
+            # state (a big box with New York cut out as a hole). Basemap town names replace the TextLayer labels.
+            _ny_ring = _geo["state"]["features"][0]["geometry"]["coordinates"][0]
+            _box = [[-110, 25], [-40, 25], [-40, 60], [-110, 60], [-110, 25]]
+            ny_mask = pdk.Layer(
+                "GeoJsonLayer",
+                data={"type": "Feature", "properties": {},
+                      "geometry": {"type": "Polygon", "coordinates": [_box, _ny_ring]}},
+                filled=True, stroked=False,
+                get_fill_color=[14, 17, 23, 255] if _dark else [255, 255, 255, 255],
+            )
+            # Town names drawn by deck.gl ABOVE the circles (Streamlit can't put basemap labels on top). They come
+            # from our own copy of the data: /ny-labels/{z}/{x}/{y}.mvt, served by nginx from /var/www/ny-labels
+            # (New York named places only, built from Carto's basemap tiles on 2026-11-24; build scripts and a tarball
+            # are in ~/backups). Each zoom's tiles carry only the places that zoom should show, so names thin out /
+            # fill in like the basemap's own. The basemap itself is still Carto's no-labels style.
+            # pydeck evaluates strings as JS expressions; binary=False so accessors see feature properties.
+            town_names = pdk.Layer(
+                "MVTLayer",
+                data="/ny-labels/{z}/{x}/{y}.mvt",
+                load_options={"mvt": {"layers": ["places"]}}, binary=False, min_zoom=5, max_zoom=12,
+                point_type="'text'", pickable=False,
+                get_text="properties.name",
+                get_text_size=12, text_size_units="'pixels'", text_font_weight=600,
+                text_font_family="'Helvetica, Arial, sans-serif'",
+                text_font_settings={"sdf": True}, text_outline_width=2,
+                text_outline_color=[14, 17, 23, 230] if _dark else [255, 255, 255, 230],
+                get_text_color=[235, 235, 230, 255] if _dark else [45, 45, 45, 255],
+                get_text_anchor="'start'", get_text_alignment_baseline="'center'", get_text_pixel_offset=[5, 0],
+            )
+            st.pydeck_chart(
+                pdk.Deck(
+                    # order, bottom to top: mask (hides the basemap outside NY), state outline, circles, town names.
+                    # Circles and labels sit above the mask, so they are NOT clipped at the state line.
+                    layers=[ny_mask, ny_state, dots, town_names],
+                    map_style=("https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json" if _dark
+                               else "https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json"),
+                    initial_view_state=pdk.ViewState(latitude=42.75, longitude=-75.85, zoom=5.45, min_zoom=5, max_zoom=15),
+                    tooltip={"html": "<b>{city}</b><br/>{patients} patients",
+                             "style": {"fontSize": "13px", "padding": "6px 10px", "borderRadius": "6px"}},
+                ),
+                height=470, width="stretch",
+            )
+            st.caption(f"{len(cv):,} New York cities; bigger circle = more patients (hover for exact counts). "
+                       "Drag to pan, scroll or double-click to zoom; use ⛶ for full screen. "
+                       "Only the Status filter applies to the map.")
+
+        c1, c2, c3 = st.columns(3, gap="large")
+        with c1:
+            st.markdown("##### Race")
+            st.altair_chart(_demo_bar_list(df, "race", total), width="stretch")
+        with c2:
+            st.markdown("##### Marital Status")
+            st.altair_chart(_demo_bar_list(df, "marital", total), width="stretch")
+        with c3:
+            st.markdown("##### Language")
+            st.altair_chart(_demo_bar_list(df, "language", total, height_per=26), width="stretch")
+        st.caption("Hover any bar for exact counts. Synthea generates these patients; they are not real people.")
+
+    demo_cube, demo_cities = load_demographics(cache_mtime)
+    if demo_cube.empty:
+        st.info("Demographics not in cache yet. Click Update Database Totals in the sidebar.")
+    else:
+        demographics_section(demo_cube, demo_cities)
 
 
 # =====================================================================================
