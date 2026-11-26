@@ -452,14 +452,12 @@ def _add_tokens(prompt, gen):
 def _show_served(slot):
     """All-time tokens served through this site (replaces the old speed tile)."""
     life = _read_tokens()
-    tier = st.session_state.get("cloud_tier", "Claude Sonnet 5.5")
-    rin, rout = CLOUD_PRICES.get(tier, CLOUD_PRICES["Claude Sonnet 5.5"])
-    cost = (life["prompt"] * rin + life["gen"] * rout) / 1e6
     since = time.strftime("%b %d", time.localtime(life["since"]))
     slot.metric(
         "🪙 All Time Tokens", _compact(life["prompt"] + life["gen"]),
-        help=f"Total tokens (prompt + generated) handled by this site's chat since {since}, across all visitors "
-             f"({life['replies']:,} replies). Roughly {_fmt_usd(cost)} on {tier}; no per-token fees here.",
+        help=f"Total tokens handled by this site's chat since {since}, across all visitors ({life['replies']:,} replies). "
+             f"Counts both the tokens sent to the model (messages, chat history and tool results) "
+             f"and the tokens it generated (replies and reasoning).",
     )
 
 
